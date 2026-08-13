@@ -1,0 +1,12 @@
+# Netlify build settings.
+# Netlify auto-detects Next.js via its OpenNext adapter, so no plugin is pinned
+# here on purpose (Netlify updates the adapter itself on each build). These
+# explicit values exist to override any incorrect settings configured in the
+# site dashboard, which is the usual cause of a site serving 404 on every path.
+
+[build]
+  command = "npm run build"
+  publish = ".next"
+
+[build.environment]
+  NODE_VERSION = "22"
