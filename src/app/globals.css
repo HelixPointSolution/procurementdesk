@@ -1,26 +1,47 @@
 @import "tailwindcss";
 
+/* This tool is deliberately light-theme only: white cards on a light grey
+ * canvas, dark text. The create-next-app starter shipped a
+ * prefers-color-scheme:dark block that repainted <body> near-black while every
+ * component kept using light-theme utilities, leaving dark text on a dark
+ * background. It also declared `body { background; color }` unlayered, which
+ * outranks Tailwind's layered utilities, so bg-gray-50/text-gray-900 in
+ * layout.tsx never applied.
+ *
+ * color-scheme:light additionally stops the browser painting form controls,
+ * scrollbars and autofill with its dark palette. */
+
 :root {
-  --background: #ffffff;
-  --foreground: #171717;
+  color-scheme: light;
 }
 
 @theme inline {
-  --color-background: var(--background);
-  --color-foreground: var(--foreground);
   --font-sans: var(--font-geist-sans);
   --font-mono: var(--font-geist-mono);
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
+@layer base {
+  body {
+    font-family: var(--font-geist-sans), Arial, Helvetica, sans-serif;
   }
-}
 
-body {
-  background: var(--background);
-  color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+  /* Kept in @layer base so per-element Tailwind utilities still override. */
+  input,
+  select,
+  textarea {
+    background-color: #ffffff;
+    color: #171717;
+  }
+
+  input::placeholder,
+  textarea::placeholder {
+    color: #9ca3af;
+    opacity: 1;
+  }
+
+  input:disabled,
+  textarea:disabled {
+    background-color: #f3f4f6;
+    color: #6b7280;
+  }
 }
