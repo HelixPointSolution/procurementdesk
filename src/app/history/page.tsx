@@ -58,7 +58,7 @@ export default function HistoryPage() {
           + Add row manually
         </button>
       </div>
-      <div className="bg-white border rounded-lg overflow-x-auto">
+      <div className="tbl-wrap overflow-x-auto">
         <table className="w-full text-sm">
           <thead className="bg-gray-100 text-left">
             <tr>
@@ -85,7 +85,14 @@ export default function HistoryPage() {
                 <Cell value={r.notes} onSave={(v) => update(r.id, { notes: v })} />
                 <td className="px-3 py-1 text-gray-400 text-xs">{r.created_by}</td>
                 <td className="px-3 py-1">
-                  <button onClick={() => remove(r.id)} className="text-red-400 hover:text-red-600">✕</button>
+                  <button
+                    onClick={() => remove(r.id)}
+                    aria-label={`Delete purchase record ${r.ref || r.awarded_to}`}
+                    title="Delete row"
+                    className="text-red-400 hover:text-red-600 px-2 py-1.5"
+                  >
+                    ✕
+                  </button>
                 </td>
               </tr>
             ))}

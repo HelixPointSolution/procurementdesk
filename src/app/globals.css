@@ -1,18 +1,33 @@
 @import "tailwindcss";
 
-/* This tool is deliberately light-theme only: white cards on a light grey
- * canvas, dark text. The create-next-app starter shipped a
+/* Light-theme only, deliberately. The create-next-app starter shipped a
  * prefers-color-scheme:dark block that repainted <body> near-black while every
- * component kept using light-theme utilities, leaving dark text on a dark
+ * component used light-theme utilities, leaving dark text on a dark
  * background. It also declared `body { background; color }` unlayered, which
- * outranks Tailwind's layered utilities, so bg-gray-50/text-gray-900 in
- * layout.tsx never applied.
+ * outranks Tailwind's layered utilities.
  *
  * color-scheme:light additionally stops the browser painting form controls,
- * scrollbars and autofill with its dark palette. */
+ * scrollbars and autofill with its dark palette.
+ *
+ * The palette below is v1's (workshoptool-psi.vercel.app), restored because the
+ * colour coding carries meaning: a purchaser scans a comparison for the yellow
+ * winning row, green matches and orange mismatches. */
 
 :root {
   color-scheme: light;
+
+  --ink: #0f1720;
+  --muted: #5b6672;
+  --line: #e3e8ee;
+  --brand: #0b5cff;
+  --brand-ink: #08307f;
+  --bg: #f4f6f9;
+  --panel: #ffffff;
+  --good: #0a6c3c;
+  --good-bg: #e6f7ee;
+  --warn: #8a4109;
+  --warn-bg: #fdf0e5;
+  --win: #fff6d6;
 }
 
 @theme inline {
@@ -23,14 +38,16 @@
 @layer base {
   body {
     font-family: var(--font-geist-sans), Arial, Helvetica, sans-serif;
+    background: var(--bg);
+    color: var(--ink);
   }
 
-  /* Kept in @layer base so per-element Tailwind utilities still override. */
+  /* In @layer base so per-element Tailwind utilities still override. */
   input,
   select,
   textarea {
     background-color: #ffffff;
-    color: #171717;
+    color: var(--ink);
   }
 
   input::placeholder,
@@ -44,4 +61,120 @@
     background-color: #f3f4f6;
     color: #6b7280;
   }
+}
+
+@layer components {
+  /* v1's banded header */
+  .app-header {
+    background: linear-gradient(135deg, var(--brand-ink), var(--brand));
+    color: #fff;
+  }
+
+  /* v1's folder-style tabs */
+  .tab-link {
+    background: #dde4ec;
+    color: var(--brand-ink);
+    border-radius: 9px 9px 0 0;
+    padding: 0.6rem 1rem;
+    font-size: 0.9rem;
+    font-weight: 600;
+    white-space: nowrap;
+  }
+  .tab-link:hover { background: #eaeff5; }
+  .tab-link.is-active {
+    background: var(--panel);
+    box-shadow: 0 -3px 0 var(--brand) inset;
+  }
+
+  .lbl {
+    display: block;
+    font-size: 0.7rem;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--muted);
+    font-weight: 700;
+    margin-bottom: 0.2rem;
+  }
+
+  .fld {
+    font: inherit;
+    padding: 0.5rem 0.6rem;
+    border: 1px solid var(--line);
+    border-radius: 7px;
+    background: #fff;
+  }
+  .fld:focus { outline: 2px solid var(--brand); border-color: var(--brand); }
+
+  .btn-primary {
+    background: var(--brand); color: #fff; border: none;
+    padding: 0.6rem 1.1rem; border-radius: 8px; font-weight: 700; font-size: 0.9rem;
+  }
+  .btn-primary:hover { background: var(--brand-ink); }
+
+  .btn-ghost {
+    background: #eaeff5; color: var(--brand-ink); border: none;
+    padding: 0.5rem 0.85rem; border-radius: 8px; font-weight: 600;
+  }
+  .btn-ghost:hover { background: #dde4ec; }
+
+  .btn-award {
+    background: var(--good); color: #fff; border: none;
+    padding: 0.6rem 1.1rem; border-radius: 8px; font-weight: 700; font-size: 0.9rem;
+  }
+  .btn-award:hover:not(:disabled) { background: #085530; }
+
+  .card {
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    padding: 0.9rem;
+    background: #fbfcfe;
+  }
+
+  .tbl-wrap {
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    background: var(--panel);
+  }
+  .tbl-wrap table { border-collapse: collapse; }
+  .tbl-wrap th, .tbl-wrap td {
+    border: 1px solid var(--line);
+    padding: 0.5rem 0.65rem;
+    text-align: left;
+  }
+  .tbl-wrap th {
+    background: #eef3f8;
+    font-size: 0.72rem;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+    color: var(--muted);
+    font-weight: 700;
+  }
+
+  /* These three carry the meaning of a comparison at a glance. */
+  .inq-row { background: #eaf0ff; font-weight: 600; }
+  .win-row { background: var(--win); }
+  .match { color: var(--good); font-weight: 700; }
+  .miss { color: var(--warn); font-weight: 700; }
+
+  .chart-title { font-weight: 700; margin: 0.4rem 0 0.35rem; font-size: 0.95rem; }
+
+  .verdict {
+    background: var(--good-bg);
+    border: 1px solid #bfe6cf;
+    border-radius: 10px;
+    padding: 1rem;
+  }
+  .verdict h3 { color: var(--good); }
+
+  .flag {
+    background: var(--warn-bg);
+    border: 1px solid #f0cfab;
+    border-radius: 8px;
+    padding: 0.6rem 0.75rem;
+    margin-top: 0.6rem;
+    font-size: 0.86rem;
+    color: var(--warn);
+  }
+
+  .hint { font-size: 0.78rem; color: var(--muted); }
 }

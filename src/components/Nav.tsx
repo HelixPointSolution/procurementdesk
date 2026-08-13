@@ -5,7 +5,7 @@ import { usePathname } from "next/navigation";
 import { useEffect, useState } from "react";
 import { supabase } from "@/lib/supabase/client";
 
-/* Tab order mirrors the client's Excel tab bar. */
+/* Tab order mirrors the client's spec workbook. */
 const TABS = [
   { href: "/rfq/material", label: "1 · RFQ Material" },
   { href: "/rfq/general", label: "2 · RFQ General" },
@@ -25,37 +25,43 @@ export default function Nav() {
   }, []);
 
   return (
-    <header className="bg-white border-b sticky top-0 z-10">
-      <div className="max-w-7xl mx-auto px-4">
-        <div className="flex items-center justify-between py-3">
-          <h1 className="font-bold text-lg">🏭 Helix Point — Procurement Desk</h1>
+    <header className="app-header">
+      <div className="max-w-5xl mx-auto px-4">
+        <div className="flex items-center justify-between py-4 gap-3 flex-wrap">
+          <div>
+            <h1 className="font-extrabold text-xl">🏭 Helix Point — Procurement Desk</h1>
+            <p className="text-sm opacity-90">
+              RFQ · Quote Comparison · Supplier Scorecard — shared with your team.
+            </p>
+          </div>
           <div className="flex items-center gap-3 text-sm">
-            <span className="text-gray-500">{email}</span>
+            <span className="opacity-90">{email}</span>
             <button
               onClick={() => supabase().auth.signOut()}
-              className="text-gray-600 hover:text-black border rounded-lg px-3 py-1"
+              className="border border-white/40 hover:bg-white/15 rounded-lg px-3 py-1.5"
             >
               Sign out
             </button>
           </div>
         </div>
-        <nav className="flex gap-1 overflow-x-auto pb-2">
+      </div>
+      <nav aria-label="Sections" className="max-w-5xl mx-auto px-4">
+        <div className="flex gap-1.5 overflow-x-auto">
           {TABS.map((t) => {
             const active = pathname.startsWith(t.href);
             return (
               <Link
                 key={t.href}
                 href={t.href}
-                className={`whitespace-nowrap rounded-lg px-3 py-1.5 text-sm font-medium ${
-                  active ? "bg-blue-600 text-white" : "text-gray-600 hover:bg-gray-100"
-                }`}
+                aria-current={active ? "page" : undefined}
+                className={`tab-link ${active ? "is-active" : ""}`}
               >
                 {t.label}
               </Link>
             );
           })}
-        </nav>
-      </div>
+        </div>
+      </nav>
     </header>
   );
 }

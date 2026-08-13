@@ -52,8 +52,15 @@ export interface ItemDims {
  * Weight in kg of ONE piece, or null when it can't be computed (missing dims
  * or a material with no meaningful density, e.g. plastics).
  *
- * Round bar (any dim carries Ø): Ø² × L × roundFactor. The diameter is
- * whichever dim has the Ø; length is the remaining populated dim.
+ * Round bar (any dim carries Ø): Ø² × L × roundFactor. The diameter is the
+ * first dim carrying Ø; the length is taken from the Length field when that
+ * isn't the diameter, otherwise the last other populated dim.
+ *
+ * Both are selected by POSITION, never by string value: filtering by value
+ * discards both dims when two happen to hold the same text (e.g. thickness and
+ * length both "Ø50"), and picking the first remaining dim would read a Ø50 ×
+ * h30 × l200 bar as 30mm long — under-weighing it by ~6.7×, which then feeds
+ * RM/kg and the award recommendation.
  */
 export function pieceWeightKg(item: ItemDims): number | null {
   const density = densityFor(item.materialType);
@@ -61,11 +68,20 @@ export function pieceWeightKg(item: ItemDims): number | null {
   const rectFactor = density * 1e-6;
 
   const dims = [item.thicknessRaw, item.heightRaw, item.lengthRaw];
-  if (isRoundItem(...dims)) {
-    const diaRaw = dims.find((d) => isRoundItem(d));
-    const dia = dimValue(diaRaw);
-    const others = dims.filter((d) => d !== diaRaw).map(dimValue);
-    const len = others.find((v) => v != null) ?? null;
+  const LENGTH_IDX = 2;
+  const diaIdx = dims.findIndex((d) => isRoundItem(d));
+  if (diaIdx !== -1) {
+    const dia = dimValue(dims[diaIdx]);
+    // Prefer the Length column; else the last other populated dim.
+    let len: number | null = null;
+    if (diaIdx !== LENGTH_IDX) len = dimValue(dims[LENGTH_IDX]);
+    if (len == null) {
+      for (let i = dims.length - 1; i >= 0; i--) {
+        if (i === diaIdx) continue;
+        const v = dimValue(dims[i]);
+        if (v != null) { len = v; break; }
+      }
+    }
     if (dia == null || len == null) return null;
     return dia * dia * len * rectFactor * ROUND_RATIO;
   }

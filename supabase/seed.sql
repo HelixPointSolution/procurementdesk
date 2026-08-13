@@ -1,5 +1,11 @@
 -- ── Supplier List seed — extracted from "Procurement Desk (1).xlsx", tab "Supplier List" ──
--- Run AFTER schema.sql. Safe to re-run (upserts suppliers, rebuilds material groups).
+-- Run AFTER schema.sql.
+--
+-- ⚠ Re-running REPLACES all material groups: the `delete from
+--   supplier_materials` below wipes any groups the team has since built or
+--   reordered in the Supplier List tab. Suppliers themselves are upserted, so
+--   their names/emails/notes survive. Re-run only to reset groups to the
+--   workbook's original contents.
 
 -- 1) Suppliers (unique by name) --------------------------------------
 insert into suppliers (name, email, note) values

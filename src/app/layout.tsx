@@ -25,10 +25,12 @@ export default function RootLayout({ children }: LayoutProps<"/">) {
       lang="en"
       className={`${geistSans.variable} ${geistMono.variable} h-full antialiased`}
     >
-      <body className="min-h-full flex flex-col bg-gray-50 text-gray-900">
+      <body className="min-h-full flex flex-col">
         <AuthGate>
           <Nav />
-          <main className="max-w-7xl w-full mx-auto px-4 py-6 flex-1">{children}</main>
+          {/* Narrow readable column, as v1 had — a wide form sprawls and is
+              harder to scan than one that fits the eye. */}
+          <main className="max-w-5xl w-full mx-auto px-4 py-6 flex-1">{children}</main>
         </AuthGate>
       </body>
     </html>

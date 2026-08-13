@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { supabase } from "./supabase/client";
 import type { SupplierRow, SupplierMaterialRow } from "./types";
 import type { MaterialGroup } from "./supplierMatch";
@@ -38,22 +38,27 @@ export function useSupplierData() {
     reload();
   }, [reload]);
 
-  const byId = new Map(suppliers.map((s) => [s.id, s]));
-  const groupMap = new Map<string, GroupWithRows>();
-  for (const r of rows) {
-    const key = `${r.category}|||${r.materials}`;
-    let g = groupMap.get(key);
-    if (!g) {
-      g = { category: r.category, materials: r.materials, suppliers: [], rowIds: [] };
-      groupMap.set(key, g);
+  // Memoised: rebuilding this in the render body returned a fresh array
+  // identity every render, which defeated the caller's useMemo and made
+  // suggestSuppliers re-scan every keyword on every keystroke.
+  const groups = useMemo(() => {
+    const byId = new Map(suppliers.map((s) => [s.id, s]));
+    const groupMap = new Map<string, GroupWithRows>();
+    for (const r of rows) {
+      const key = `${r.category}|||${r.materials}`;
+      let g = groupMap.get(key);
+      if (!g) {
+        g = { category: r.category, materials: r.materials, suppliers: [], rowIds: [] };
+        groupMap.set(key, g);
+      }
+      const sup = byId.get(r.supplier_id);
+      if (sup) {
+        g.suppliers.push({ name: sup.name, email: sup.email });
+        g.rowIds.push(r.id);
+      }
     }
-    const sup = byId.get(r.supplier_id);
-    if (sup) {
-      g.suppliers.push({ name: sup.name, email: sup.email });
-      g.rowIds.push(r.id);
-    }
-  }
-  const groups = [...groupMap.values()];
+    return [...groupMap.values()];
+  }, [suppliers, rows]);
 
   return { suppliers, rows, groups, loading, error, reload };
 }

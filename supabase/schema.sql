@@ -1,10 +1,12 @@
--- ── Helix Point Procurement Desk v2 — database schema ────────────────
--- Run this in the Supabase SQL editor (Dashboard → SQL Editor → New query).
--- Safe to re-run: drops and recreates the v2 tables.
--- NOTE: does NOT touch the v1 tables (rounds, suppliers from the old app).
---       The old public."suppliers" table from v1 conflicts by name — v2 uses
---       its own tables below. Drop the old ones manually once migrated:
---         drop table if exists rounds;  -- old v1 table (sample data only)
+-- ── Helix Point Procurement Desk v2 — INITIAL database schema ────────
+--
+-- ⚠ DESTRUCTIVE — FIRST-TIME SETUP ONLY.
+--   The drops below delete EVERY RFQ, quote, award and purchase-history row.
+--   Do NOT re-run this on a database already in use. To add later changes,
+--   put them in supabase/migrations/ as additive statements instead.
+--
+-- Run once in the Supabase SQL editor (Dashboard → SQL Editor → New query),
+-- then run seed.sql.
 
 create extension if not exists pgcrypto;
 

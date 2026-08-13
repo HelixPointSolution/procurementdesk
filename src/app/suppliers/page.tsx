@@ -164,9 +164,9 @@ export default function SuppliersPage() {
                           <span className="text-gray-400 w-5 text-right">{i + 1}.</span>
                           <span className="w-52 truncate font-medium">{s.name}</span>
                           <span className="flex-1 truncate text-gray-500">{s.email ?? sup?.note ?? ""}</span>
-                          <button onClick={() => moveMember(g.rowIds[i], -1)} disabled={busy || i === 0} className="px-1 text-gray-400 hover:text-black disabled:opacity-30">▲</button>
-                          <button onClick={() => moveMember(g.rowIds[i], 1)} disabled={busy || i === g.suppliers.length - 1} className="px-1 text-gray-400 hover:text-black disabled:opacity-30">▼</button>
-                          <button onClick={() => removeMember(g.rowIds[i])} disabled={busy} className="px-1 text-red-400 hover:text-red-600">✕</button>
+                          <button onClick={() => moveMember(g.rowIds[i], -1)} disabled={busy || i === 0} aria-label={`Move ${s.name} up`} title="Move up" className="px-2 py-1.5 text-gray-400 hover:text-black disabled:opacity-30">▲</button>
+                          <button onClick={() => moveMember(g.rowIds[i], 1)} disabled={busy || i === g.suppliers.length - 1} aria-label={`Move ${s.name} down`} title="Move down" className="px-2 py-1.5 text-gray-400 hover:text-black disabled:opacity-30">▼</button>
+                          <button onClick={() => removeMember(g.rowIds[i])} disabled={busy} aria-label={`Remove ${s.name} from group`} title="Remove from group" className="px-2 py-1.5 text-red-400 hover:text-red-600">✕</button>
                         </div>
                       );
                     })}
@@ -207,7 +207,7 @@ export default function SuppliersPage() {
 
       <section>
         <h2 className="text-lg font-bold mb-2">All suppliers</h2>
-        <div className="bg-white border rounded-lg overflow-hidden">
+        <div className="bg-white border rounded-lg overflow-x-auto">
           <table className="w-full text-sm">
             <thead className="bg-gray-100 text-left">
               <tr>
@@ -233,7 +233,7 @@ export default function SuppliersPage() {
                       onBlur={(e) => e.target.value.trim() !== s.note && updateSupplier(s.id, { note: e.target.value.trim() })} />
                   </td>
                   <td className="px-3 py-1">
-                    <button onClick={() => deleteSupplier(s.id, s.name)} disabled={busy} className="text-red-400 hover:text-red-600">✕</button>
+                    <button onClick={() => deleteSupplier(s.id, s.name)} disabled={busy} aria-label={`Delete supplier ${s.name}`} title="Delete supplier" className="text-red-400 hover:text-red-600 px-2 py-1.5">✕</button>
                   </td>
                 </tr>
               ))}

@@ -1,6 +1,12 @@
-/* RFQ email generation — layout mirrors the Excel tabs "RFQ Material"
- * (rows 14–34) and "RFQ General" (rows 11–26). Dimension notation
- * ("(9.50)", "Ø4.00") is inserted verbatim — client requirement.
+/* RFQ email generation.
+ *
+ * Format follows v1's numbered lines rather than a space-aligned table.
+ * Padded columns only line up in a monospace font, and Gmail's compose body —
+ * where these are actually sent from — is proportional, so an aligned table
+ * arrives at the supplier ragged and harder to read than plain lines.
+ *
+ * Dimension notation ("(9.50)" order size, "Ø4.00" diameter) is inserted
+ * verbatim: the client requires brackets and the Ø to survive into the email.
  */
 
 export interface MaterialEmailItem {
@@ -24,33 +30,35 @@ const SIGNATURE = [
   "enquiry.helixpoint@gmail.com",
 ];
 
-/** Pad columns to align in a plain-text (monospace) table. */
-function table(headers: string[], rows: string[][]): string {
-  const widths = headers.map((h, i) =>
-    Math.max(h.length, ...rows.map((r) => (r[i] ?? "").length))
-  );
-  const fmt = (cells: string[]) =>
-    cells.map((c, i) => (c ?? "").padEnd(widths[i])).join("  ").trimEnd();
-  return [fmt(headers), ...rows.map(fmt)].join("\n");
+function qtyPart(qty: number | null): string {
+  return qty == null ? "" : ` = ${qty} PCS`;
 }
 
-function qtyStr(qty: number | null): string {
-  return qty == null ? "" : String(qty);
+function refPart(ref: string): string {
+  return ref.trim() ? `   Ref: ${ref.trim()}` : "";
+}
+
+/** "1. SS 304  (2.00) X (122.00) X (180.00) = 4 PCS   Ref: SO26-08134 (1)" */
+function materialLine(it: MaterialEmailItem, i: number): string {
+  const dims = [it.thicknessRaw, it.heightRaw, it.lengthRaw]
+    .map((d) => d.trim())
+    .filter(Boolean)
+    .join(" X ");
+  const material = it.materialType.trim();
+  const head = [`${i + 1}.`, material, dims].filter(Boolean).join(" ");
+  return `${head}${qtyPart(it.qty)}${refPart(it.itemRef)}`;
+}
+
+/** "1. Carbide Tap Mill 2.500mm X 3.30mm = 3 PCS   Ref: SO26-01101" */
+function generalLine(it: GeneralEmailItem, i: number): string {
+  const head = `${i + 1}. ${it.description.trim()}`;
+  return `${head}${qtyPart(it.qty)}${refPart(it.itemRef)}`;
 }
 
 export function buildMaterialEmail(subject: string, items: MaterialEmailItem[]): {
   subject: string;
   body: string;
 } {
-  const rows = items.map((it, i) => [
-    `Item ${i + 1}`,
-    it.materialType,
-    it.thicknessRaw,
-    it.heightRaw,
-    it.lengthRaw,
-    qtyStr(it.qty),
-    it.itemRef,
-  ]);
   const body = [
     "Dear Supplier,",
     "",
@@ -58,7 +66,7 @@ export function buildMaterialEmail(subject: string, items: MaterialEmailItem[]):
     "*(00.00) = order size in mm",
     "*0.00 = Finishing size: max allowance +5mm.",
     "",
-    table(["", "Material Type", "Thickness", "Height", "Length", "Qty", "Ref"], rows),
+    ...items.map(materialLine),
     "",
     "Payment Term:",
     "",
@@ -75,18 +83,12 @@ export function buildGeneralEmail(subject: string, items: GeneralEmailItem[]): {
   subject: string;
   body: string;
 } {
-  const rows = items.map((it, i) => [
-    `Item ${i + 1}`,
-    it.description,
-    qtyStr(it.qty),
-    it.itemRef,
-  ]);
   const body = [
     "Dear Supplier,",
     "",
     "Please quote for the following:",
     "",
-    table(["", "Description", "Qty", "Ref"], rows),
+    ...items.map(generalLine),
     "",
     "Please advise the soonest Delivery Date, and Stock availability.",
     "Thank you.",
@@ -112,4 +114,15 @@ export function gmailComposeUrl(to: string[], subject: string, body: string): st
 export function mailtoUrl(to: string[], subject: string, body: string): string {
   const addr = to.filter(Boolean).join(",");
   return `mailto:${addr}?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
+}
+
+/**
+ * Practical URL ceiling. Windows caps mailto: near 2 KB and Gmail's compose
+ * URL has its own limit; past this the item list is silently truncated, so the
+ * UI warns and steers the user to Copy instead.
+ */
+export const MAIL_URL_SAFE_LIMIT = 1800;
+
+export function mailUrlTooLong(url: string): boolean {
+  return url.length > MAIL_URL_SAFE_LIMIT;
 }

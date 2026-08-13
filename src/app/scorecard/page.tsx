@@ -1,8 +1,10 @@
 "use client";
 
-/* Tab 5 — Supplier Scorecard (ported from the v1 tool).
- * Weighted 1–5 ratings per supplier, shared with the team via the
- * scorecards table.
+/* Tab 5 — Supplier Scorecard. Weighted 1–5 ratings per supplier, team-shared.
+ *
+ * Rows are keyed on the server id, not the (editable) supplier name — keying
+ * on the name meant renaming a supplier then deleting removed nothing, and
+ * saving after a rename created a duplicate row instead of renaming.
  */
 
 import { useEffect, useState } from "react";
@@ -17,8 +19,20 @@ const CRIT: Array<[string, number]> = [
   ["Payment terms", 1],
 ];
 const MAX = CRIT.reduce((a, c) => a + c[1] * 5, 0);
+const DEFAULT_SCORES = [3, 3, 3, 3, 3];
+
+/** Pad/truncate to exactly one score per criterion — a short array used to
+ *  display as 3 but contribute 0 to the weighted total. */
+function normaliseScores(scores: number[] | null | undefined): number[] {
+  const out = [...DEFAULT_SCORES];
+  (scores ?? []).slice(0, CRIT.length).forEach((v, i) => {
+    if (Number.isFinite(v)) out[i] = Math.max(1, Math.min(5, Math.round(v)));
+  });
+  return out;
+}
 
 interface Draft {
+  id?: string;
   supplierName: string;
   scores: number[];
   note: string;
@@ -28,57 +42,79 @@ export default function ScorecardPage() {
   const [drafts, setDrafts] = useState<Draft[]>([]);
   const [suppliers, setSuppliers] = useState<SupplierRow[]>([]);
   const [loading, setLoading] = useState(true);
-  const [ranked, setRanked] = useState(false);
   const [msg, setMsg] = useState("");
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
 
-  useEffect(() => {
+  async function load() {
     const sb = supabase();
-    Promise.all([
+    const [sc, sup] = await Promise.all([
       sb.from("scorecards").select("*").order("supplier_name"),
       sb.from("suppliers").select("*").order("name"),
-    ]).then(([sc, sup]) => {
-      setDrafts(
-        ((sc.data as ScorecardRow[]) ?? []).map((r) => ({
-          supplierName: r.supplier_name,
-          scores: [...r.scores],
-          note: r.note,
-        }))
-      );
-      setSuppliers((sup.data as SupplierRow[]) ?? []);
-      setLoading(false);
-    });
-  }, []);
+    ]);
+    if (sc.error) setError(sc.error.message);
+    else {
+      setDrafts(((sc.data as ScorecardRow[]) ?? []).map((r) => ({
+        id: r.id,
+        supplierName: r.supplier_name,
+        scores: normaliseScores(r.scores),
+        note: r.note,
+      })));
+      setError("");
+    }
+    if (!sup.error) setSuppliers((sup.data as SupplierRow[]) ?? []);
+    setLoading(false);
+  }
+  useEffect(() => { load(); }, []);
 
   function setDraft(i: number, patch: Partial<Draft>) {
-    setDrafts(drafts.map((d, j) => (j === i ? { ...d, ...patch } : d)));
+    setDrafts((prev) => prev.map((d, j) => (j === i ? { ...d, ...patch } : d)));
   }
 
   async function save() {
-    const { data: userData } = await supabase().auth.getUser();
-    const rows = drafts
-      .filter((d) => d.supplierName.trim())
-      .map((d) => ({
+    setBusy(true);
+    setMsg("");
+    const sb = supabase();
+    const { data: userData } = await sb.auth.getUser();
+    const who = userData.user?.email ?? "";
+    const named = drafts.filter((d) => d.supplierName.trim());
+
+    for (const d of named) {
+      const payload = {
         supplier_name: d.supplierName.trim(),
-        scores: d.scores,
+        scores: normaliseScores(d.scores),
         note: d.note,
-        updated_by: userData.user?.email ?? "",
+        updated_by: who,
         updated_at: new Date().toISOString(),
-      }));
-    const { error } = await supabase()
-      .from("scorecards")
-      .upsert(rows, { onConflict: "supplier_name" });
-    setMsg(error ? "Error: " + error.message : "Saved to team ✓");
+      };
+      const res = d.id
+        ? await sb.from("scorecards").update(payload).eq("id", d.id)
+        : await sb.from("scorecards").insert(payload);
+      if (res.error) {
+        setError(res.error.message);
+        setBusy(false);
+        return;
+      }
+    }
+    setError("");
+    setMsg("Saved to team ✓");
+    setBusy(false);
+    load();
   }
 
   async function removeDraft(i: number) {
     const d = drafts[i];
-    if (d.supplierName.trim() && !confirm(`Remove scorecard for "${d.supplierName}"?`)) return;
-    await supabase().from("scorecards").delete().eq("supplier_name", d.supplierName.trim());
-    setDrafts(drafts.filter((_, j) => j !== i));
+    if (d.id && !confirm(`Remove scorecard for "${d.supplierName}"?`)) return;
+    if (d.id) {
+      const { error } = await supabase().from("scorecards").delete().eq("id", d.id);
+      if (error) { setError(error.message); return; }
+    }
+    setDrafts((prev) => prev.filter((_, j) => j !== i));
   }
 
-  const total = (d: Draft) => CRIT.reduce((a, c, i) => a + c[1] * (d.scores[i] || 0), 0);
-  const rankedRows = drafts
+  const total = (d: Draft) =>
+    CRIT.reduce((a, c, i) => a + c[1] * (normaliseScores(d.scores)[i] ?? 0), 0);
+  const ranked = drafts
     .filter((d) => d.supplierName.trim())
     .map((d) => ({ ...d, tot: total(d) }))
     .sort((a, b) => b.tot - a.tot);
@@ -89,45 +125,56 @@ export default function ScorecardPage() {
     <div className="space-y-4">
       <div>
         <h2 className="text-xl font-bold">Supplier Scorecard</h2>
-        <p className="text-sm text-gray-500">Score 1–5 per criterion (weights in ×N). Shared with the whole team.</p>
+        <p className="hint">Score 1–5 per criterion (weights ×N). Shared with the whole team.</p>
       </div>
+      {error && <div className="flag" role="alert">{error}</div>}
 
       {drafts.map((d, i) => (
-        <div key={i} className="bg-white border rounded-lg p-3">
+        <div key={d.id ?? `new-${i}`} className="card">
           <div className="flex gap-2 items-end flex-wrap">
-            <div className="flex-1 min-w-56">
-              <label className="block text-xs text-gray-500">Supplier</label>
+            <div className="flex-1 min-w-52">
+              <label htmlFor={`sc-name-${i}`} className="lbl">Supplier</label>
               <input
+                id={`sc-name-${i}`}
                 value={d.supplierName}
                 onChange={(e) => setDraft(i, { supplierName: e.target.value })}
                 list="supplier-names-score"
-                className="w-full border rounded-lg px-2 py-1.5 text-sm font-medium"
+                className="w-full fld text-sm font-medium"
               />
             </div>
             {CRIT.map((c, ci) => (
               <div key={c[0]} className="w-28">
-                <label className="block text-xs text-gray-500">{c[0]} ×{c[1]}</label>
+                <label htmlFor={`sc-${i}-${ci}`} className="lbl">{c[0]} ×{c[1]}</label>
                 <input
+                  id={`sc-${i}-${ci}`}
                   type="number" min={1} max={5}
-                  value={d.scores[ci] ?? 3}
+                  value={normaliseScores(d.scores)[ci]}
                   onChange={(e) => {
-                    const s = [...d.scores];
+                    const s = normaliseScores(d.scores);
                     s[ci] = Math.max(1, Math.min(5, Number(e.target.value) || 1));
                     setDraft(i, { scores: s });
                   }}
-                  className="w-full border rounded-lg px-2 py-1.5 text-sm"
+                  className="w-full fld text-sm"
                 />
               </div>
             ))}
-            <div className="pb-1.5 text-sm font-bold w-20">{total(d)} / {MAX}</div>
-            <button onClick={() => removeDraft(i)} className="text-red-400 hover:text-red-600 pb-1.5">✕</button>
+            <div className="pb-2 text-sm font-bold w-20">{total(d)} / {MAX}</div>
+            <button
+              onClick={() => removeDraft(i)}
+              aria-label={`Remove scorecard for ${d.supplierName || "supplier"}`}
+              className="text-red-400 hover:text-red-600 px-2 py-2"
+            >
+              ✕
+            </button>
           </div>
           <div className="mt-2">
+            <label htmlFor={`sc-note-${i}`} className="lbl">Notes</label>
             <input
+              id={`sc-note-${i}`}
               value={d.note}
               onChange={(e) => setDraft(i, { note: e.target.value })}
-              placeholder="Notes — e.g. reliability, terms, quality history"
-              className="w-full border rounded-lg px-2 py-1.5 text-sm"
+              placeholder="e.g. reliability, terms, quality history"
+              className="w-full fld text-sm"
             />
           </div>
         </div>
@@ -138,42 +185,42 @@ export default function ScorecardPage() {
 
       <div className="flex gap-2 flex-wrap items-center">
         <button
-          onClick={() => setDrafts([...drafts, { supplierName: "", scores: [3, 3, 3, 3, 3], note: "" }])}
-          className="border rounded-lg px-3 py-1.5 text-sm hover:bg-gray-100"
+          onClick={() => setDrafts((prev) => [...prev, { supplierName: "", scores: [...DEFAULT_SCORES], note: "" }])}
+          className="btn-ghost text-sm"
         >
           + Add supplier
         </button>
-        <button onClick={() => setRanked(true)} className="bg-blue-600 text-white rounded-lg px-4 py-2 text-sm font-medium">
-          🏆 Rank suppliers
-        </button>
-        <button onClick={save} className="bg-gray-900 text-white rounded-lg px-4 py-2 text-sm font-medium">
-          ☁️ Save to team
+        <button onClick={save} disabled={busy} className="btn-primary disabled:opacity-50">
+          {busy ? "Saving…" : "☁️ Save to team"}
         </button>
         {msg && <span className="text-sm text-green-700">{msg}</span>}
       </div>
 
-      {ranked && (
-        <div className="bg-white border rounded-lg overflow-hidden">
-          <table className="w-full text-sm">
-            <thead className="bg-gray-100 text-left">
-              <tr>
-                <th className="px-3 py-2 w-16">Rank</th>
-                <th className="px-3 py-2">Supplier</th>
-                <th className="px-3 py-2">Weighted score</th>
-                <th className="px-3 py-2">Notes</th>
-              </tr>
-            </thead>
-            <tbody className="divide-y">
-              {rankedRows.map((r, i) => (
-                <tr key={r.supplierName} className={i === 0 ? "bg-green-50" : ""}>
-                  <td className="px-3 py-2">{i === 0 ? "🏆 1" : i + 1}</td>
-                  <td className="px-3 py-2 font-medium">{r.supplierName}</td>
-                  <td className="px-3 py-2"><b>{r.tot}</b> / {MAX}</td>
-                  <td className="px-3 py-2 text-gray-500">{r.note || "—"}</td>
+      {ranked.length > 0 && (
+        <div>
+          <div className="chart-title">Ranking</div>
+          <div className="overflow-x-auto tbl-wrap">
+            <table className="w-full text-sm">
+              <thead>
+                <tr>
+                  <th scope="col" className="w-16">Rank</th>
+                  <th scope="col">Supplier</th>
+                  <th scope="col">Weighted score</th>
+                  <th scope="col">Notes</th>
                 </tr>
-              ))}
-            </tbody>
-          </table>
+              </thead>
+              <tbody>
+                {ranked.map((r, i) => (
+                  <tr key={r.id ?? r.supplierName} className={i === 0 ? "win-row" : ""}>
+                    <td>{i === 0 ? "🏆 1" : i + 1}</td>
+                    <td className="font-medium">{r.supplierName}</td>
+                    <td><b>{r.tot}</b> / {MAX}</td>
+                    <td className="text-gray-600">{r.note || "—"}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
         </div>
       )}
     </div>
