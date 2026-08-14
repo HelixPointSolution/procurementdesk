@@ -51,15 +51,16 @@ export default function SuppliersPage() {
     await run(() => supabase().from("suppliers").delete().eq("id", id));
   }
 
+  /* A group exists only through its member rows, so creating one requires a
+   * first supplier. Previously this pushed an in-memory draft and popped an
+   * alert, producing a group that looked real but vanished on refresh. */
+  const [gSupplier, setGSupplier] = useState("");
+
   async function addGroup() {
-    if (!gCategory.trim() || !gMaterials.trim()) return;
-    // A group only exists through its member rows; require picking a supplier after.
-    alert("Group created empty — now add a supplier to it below.");
-    setGroupsDraft([...groupsDraft, { category: gCategory.trim().toUpperCase(), materials: gMaterials.trim() }]);
-    setGCategory(""); setGMaterials("");
+    if (!gCategory.trim() || !gMaterials.trim() || !gSupplier) return;
+    await addMember(gCategory.trim().toUpperCase(), gMaterials.trim(), gSupplier);
+    setGCategory(""); setGMaterials(""); setGSupplier("");
   }
-  // Draft groups not yet persisted (they persist when the first member is added)
-  const [groupsDraft, setGroupsDraft] = useState<Array<{ category: string; materials: string }>>([]);
 
   async function addMember(category: string, materials: string, supplierId: string) {
     if (!supplierId) return;
@@ -73,7 +74,6 @@ export default function SuppliersPage() {
         sort_order: maxOrder + 1,
       })
     );
-    setGroupsDraft(groupsDraft.filter((d) => d.category !== category || d.materials !== materials));
   }
 
   async function removeMember(rowId: string) {
@@ -116,10 +116,7 @@ export default function SuppliersPage() {
   if (loading) return <div className="text-gray-500">Loading…</div>;
   if (error) return <div className="text-red-600">Error: {error} — is the schema applied? (supabase/schema.sql + seed.sql)</div>;
 
-  const allGroups = [
-    ...groups.map((g) => ({ ...g, draft: false })),
-    ...groupsDraft.map((d) => ({ ...d, suppliers: [], rowIds: [], draft: true })),
-  ];
+  const allGroups = groups.map((g) => ({ ...g, draft: false }));
   const categories = [...new Set(allGroups.map((g) => g.category))];
 
   return (
@@ -129,6 +126,16 @@ export default function SuppliersPage() {
         <p className="text-sm text-gray-500 mb-4">
           Material groups drive the RFQ&apos;s suggested emails — order inside a group is priority (top = Suggest email 1).
         </p>
+
+        {suppliers.length === 0 && (
+          <div className="flag mb-4">
+            <b>No suppliers loaded.</b> Run <code>supabase/seed.sql</code> in Supabase →
+            SQL Editor to import them from the workbook. If you have already run it and this
+            is still empty, run{" "}
+            <code>supabase/migrations/002_diagnose_and_repair_rls.sql</code> — an empty list
+            with no error usually means row-level security is blocking reads.
+          </div>
+        )}
 
         {categories.map((cat) => (
           <div key={cat} className="mb-6">
@@ -192,16 +199,33 @@ export default function SuppliersPage() {
           </div>
         ))}
 
-        <div className="bg-white border rounded-lg p-3 flex flex-wrap gap-2 items-end">
+        <div className="card flex flex-wrap gap-2 items-end">
           <div>
-            <label className="block text-xs text-gray-500">New group — Category</label>
-            <input value={gCategory} onChange={(e) => setGCategory(e.target.value)} placeholder="e.g. STAINLESS STEEL" className="border rounded-lg px-2 py-1 text-sm" />
+            <label htmlFor="new-group-cat" className="lbl">New group — Category</label>
+            <input id="new-group-cat" value={gCategory} onChange={(e) => setGCategory(e.target.value)} placeholder="e.g. STAINLESS STEEL" className="fld text-sm" />
           </div>
-          <div className="flex-1 min-w-60">
-            <label className="block text-xs text-gray-500">Materials (comma-separated keywords)</label>
-            <input value={gMaterials} onChange={(e) => setGMaterials(e.target.value)} placeholder="e.g. SUS 303, SUS 304, 316L" className="w-full border rounded-lg px-2 py-1 text-sm" />
+          <div className="flex-1 min-w-56">
+            <label htmlFor="new-group-mat" className="lbl">Materials (comma-separated keywords)</label>
+            <input id="new-group-mat" value={gMaterials} onChange={(e) => setGMaterials(e.target.value)} placeholder="e.g. SUS 303, SUS 304, 316L" className="w-full fld text-sm" />
           </div>
-          <button onClick={addGroup} disabled={busy} className="bg-blue-600 text-white rounded-lg px-3 py-1.5 text-sm font-medium">+ Add group</button>
+          <div>
+            <label htmlFor="new-group-sup" className="lbl">First supplier</label>
+            <select id="new-group-sup" value={gSupplier} onChange={(e) => setGSupplier(e.target.value)} className="fld text-sm">
+              <option value="">— choose —</option>
+              {suppliers.map((s) => <option key={s.id} value={s.id}>{s.name}</option>)}
+            </select>
+          </div>
+          <button
+            onClick={addGroup}
+            disabled={busy || !gCategory.trim() || !gMaterials.trim() || !gSupplier}
+            className="btn-primary text-sm disabled:opacity-50"
+          >
+            + Add group
+          </button>
+          <p className="hint w-full">
+            A group is defined by its suppliers, so it needs at least one to exist. Add more
+            afterwards with the dropdown inside the group.
+          </p>
         </div>
       </section>
 
