@@ -1,4 +1,17 @@
 -- ── Supplier List seed — extracted from "Procurement Desk (1).xlsx", tab "Supplier List" ──
+--
+-- HOW TO RUN — both points matter:
+--   1. Press Ctrl+A in the SQL Editor before pressing Run. The editor executes
+--      ONLY the highlighted text when a selection exists, and running just the
+--      lower half joins against an empty suppliers table, inserts nothing, and
+--      still reports "Success. No rows returned".
+--   2. Never run schema.sql after this file — schema.sql drops every table and
+--      would wipe what this loads.
+--
+-- This file ends with a SELECT, so a successful run always prints
+-- suppliers_loaded = 50 and memberships_loaded = 86 in the Results panel.
+-- If you do not see those two numbers, the import did not happen.
+--
 -- Run AFTER schema.sql.
 --
 -- ⚠ Re-running REPLACES all material groups: the `delete from
@@ -116,8 +129,10 @@ from groups g
 cross join lateral unnest(g.supplier_names) with ordinality as ord(supplier_name, n)
 join suppliers s on s.name = ord.supplier_name;
 
--- Sanity check — paste this after running the file. Expect 50 / 22 / 86:
---   select
---     (select count(*) from suppliers)          as suppliers,
---     (select count(distinct (category, materials)) from supplier_materials) as groups,
---     (select count(*) from supplier_materials) as memberships;
+-- 3) Proof of import ---------------------------------------------------
+-- Always runs, so the Results panel can never show a bare "Success" for an
+-- import that silently did nothing.
+select
+  (select count(*) from suppliers)                                       as suppliers_loaded,   -- expect 50
+  (select count(distinct (category, materials)) from supplier_materials) as groups_loaded,      -- expect 22
+  (select count(*) from supplier_materials)                              as memberships_loaded; -- expect 86
