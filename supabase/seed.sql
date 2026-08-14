@@ -116,5 +116,8 @@ from groups g
 cross join lateral unnest(g.supplier_names) with ordinality as ord(supplier_name, n)
 join suppliers s on s.name = ord.supplier_name;
 
--- Sanity: expect 51 suppliers, 22 groups, ~86 supplier_materials rows
--- select count(*) from suppliers; select count(*) from supplier_materials;
+-- Sanity check — paste this after running the file. Expect 50 / 22 / 86:
+--   select
+--     (select count(*) from suppliers)          as suppliers,
+--     (select count(distinct (category, materials)) from supplier_materials) as groups,
+--     (select count(*) from supplier_materials) as memberships;
