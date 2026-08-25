@@ -19,15 +19,13 @@ import type { RfqKind, RfqRow, RfqItemRow } from "@/lib/types";
 import { useSupplierData } from "@/lib/useSupplierData";
 import { suggestSuppliers } from "@/lib/supplierMatch";
 import { parseQty } from "@/lib/num";
+import { looksLikeRoundStock } from "@/lib/weight";
 import { debounce, syncRows, type SaveState } from "@/lib/persist";
 import SaveIndicator from "./SaveIndicator";
 import {
-  buildGeneralEmail, buildMaterialEmail, gmailComposeUrl, mailtoUrl, mailUrlTooLong,
+  buildGeneralEmail, buildMaterialEmail, gmailComposeUrl, mailtoUrl,
+  mailUrlTooLong, type BuiltEmail,
 } from "@/lib/email";
-import {
-  SAMPLE_GENERAL_ITEMS, SAMPLE_GENERAL_SUBJECT,
-  SAMPLE_MATERIAL_ITEMS, SAMPLE_MATERIAL_SUBJECT,
-} from "@/lib/sample";
 
 interface ItemDraft {
   /** Server id; absent until the row has been inserted. */
@@ -61,7 +59,7 @@ export default function RfqEditor({ kind }: { kind: RfqKind }) {
   const [subject, setSubject] = useState("");
   const [items, setItems] = useState<ItemDraft[]>([{ ...BLANK }]);
   const [recipients, setRecipients] = useState("");
-  const [preview, setPreview] = useState<{ subject: string; body: string } | null>(null);
+  const [preview, setPreview] = useState<BuiltEmail | null>(null);
   const [saveState, setSaveState] = useState<SaveState>("idle");
   const [saveError, setSaveError] = useState("");
   const [listError, setListError] = useState("");
@@ -221,17 +219,6 @@ export default function RfqEditor({ kind }: { kind: RfqKind }) {
     setTimeout(() => { loading.current = false; }, 0);
   }, [autosave]);
 
-  function loadExample() {
-    touch();
-    setSubject(isMaterial ? SAMPLE_MATERIAL_SUBJECT : SAMPLE_GENERAL_SUBJECT);
-    setItems(
-      isMaterial
-        ? SAMPLE_MATERIAL_ITEMS.map((s) => ({ ...BLANK, ...s }))
-        : SAMPLE_GENERAL_ITEMS.map((s) => ({ ...BLANK, ...s }))
-    );
-    setPreview(null);
-  }
-
   async function deleteRfq(id: string) {
     if (!confirm("Delete this RFQ? Supplier quotes against it are deleted too. This cannot be undone.")) return;
     const { error } = await supabase().from("rfqs").delete().eq("id", id);
@@ -272,7 +259,8 @@ export default function RfqEditor({ kind }: { kind: RfqKind }) {
   async function copyBody() {
     if (!preview) return;
     try {
-      await navigator.clipboard.writeText(preview.body);
+      // Copy variant has no signature — their Gmail auto-inserts one on paste.
+      await navigator.clipboard.writeText(preview.bodyForCopy);
       setCopied(true);
       setTimeout(() => setCopied(false), 2000);
     } catch {
@@ -286,7 +274,7 @@ export default function RfqEditor({ kind }: { kind: RfqKind }) {
   }
 
   const toList = recipients.split(/[,;\s]+/).map((s) => s.trim()).filter(Boolean);
-  const gmailUrl = preview ? gmailComposeUrl(toList, preview.subject, preview.body) : "";
+  const gmailUrl = preview ? gmailComposeUrl(toList, preview.subject, preview.bodyForMail) : "";
   const tooLong = preview ? mailUrlTooLong(gmailUrl) : false;
 
   return (
@@ -343,14 +331,13 @@ export default function RfqEditor({ kind }: { kind: RfqKind }) {
           />
         </div>
 
-        <div className="flex gap-2 flex-wrap items-center">
-          <button onClick={loadExample} className="btn-ghost text-sm">📋 Load example</button>
-          {currentId && (
+        {currentId && (
+          <div className="flex gap-2 flex-wrap items-center">
             <Link href={`/compare/${kind}?rfq=${currentId}`} className="btn-ghost text-sm">
               Compare quotes →
             </Link>
-          )}
-        </div>
+          </div>
+        )}
 
         {isMaterial && (
           <p className="text-xs text-gray-500">
@@ -390,6 +377,13 @@ export default function RfqEditor({ kind }: { kind: RfqKind }) {
               {it.qty.trim() !== "" && parseQty(it.qty) == null && (
                 <div className="mt-1 text-xs text-amber-700">
                   Qty must be a positive number — this item can&apos;t be priced in the comparison.
+                </div>
+              )}
+              {isMaterial &&
+                looksLikeRoundStock(it.materialType, it.thicknessRaw, it.heightRaw, it.lengthRaw) && (
+                <div className="mt-1 text-xs text-amber-700">
+                  Round bar? Mark the diameter with <b>Ø</b> (e.g. Ø127.00) and leave the
+                  other dimension blank — otherwise weight and RM/kg can&apos;t be computed.
                 </div>
               )}
               {isMaterial && suggestions[i].length > 0 && (
@@ -435,10 +429,10 @@ export default function RfqEditor({ kind }: { kind: RfqKind }) {
               {!tooLong && (
                 <>
                   <a href={gmailUrl} target="_blank" rel="noopener noreferrer" className="btn-ghost text-sm">
-                    ✉️ Open in Gmail
+                    ✉️ Open in Gmail (BCC)
                   </a>
-                  <a href={mailtoUrl(toList, preview.subject, preview.body)} className="btn-ghost text-sm">
-                    📨 Mail app
+                  <a href={mailtoUrl(toList, preview.subject, preview.bodyForMail)} className="btn-ghost text-sm">
+                    📨 Mail app (BCC)
                   </a>
                 </>
               )}
@@ -454,7 +448,10 @@ export default function RfqEditor({ kind }: { kind: RfqKind }) {
         {preview && (
           <div className="space-y-2">
             <div>
-              <label htmlFor="rfq-to" className="lbl">To (from suggestions — edit freely)</label>
+              <label htmlFor="rfq-to" className="lbl">
+                Recipients (from suggestions — edit freely) —{" "}
+                <span className="text-red-700 normal-case font-bold">⚠ must use BCC</span>
+              </label>
               <input
                 id="rfq-to"
                 value={recipients}
@@ -462,16 +459,24 @@ export default function RfqEditor({ kind }: { kind: RfqKind }) {
                 className="w-full fld text-sm"
                 placeholder="supplier1@x.com, supplier2@y.com"
               />
+              <p className="hint mt-1">
+                The Gmail / Mail app buttons put every address in <b>BCC</b> automatically,
+                so suppliers never see each other. If you paste manually, use the BCC field.
+              </p>
             </div>
             <div>
               <label htmlFor="rfq-body" className="lbl">Subject: {preview.subject}</label>
               <textarea
                 id="rfq-body"
                 readOnly
-                value={preview.body}
-                rows={Math.min(26, preview.body.split("\n").length + 1)}
+                value={preview.bodyForMail}
+                rows={Math.min(26, preview.bodyForMail.split("\n").length + 1)}
                 className="w-full fld font-mono text-xs bg-gray-50"
               />
+              <p className="hint mt-1">
+                <b>Copy</b> omits the signature block — your Gmail adds its own signature when
+                you paste into a new email. The Gmail / Mail app buttons include it.
+              </p>
             </div>
           </div>
         )}

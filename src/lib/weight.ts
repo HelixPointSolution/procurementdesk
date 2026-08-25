@@ -71,14 +71,14 @@ export function pieceWeightKg(item: ItemDims): number | null {
   const LENGTH_IDX = 2;
   const diaIdx = dims.findIndex((d) => isRoundItem(d));
   if (diaIdx !== -1) {
-    const dia = dimValue(dims[diaIdx]);
+    const dia = posDimValue(dims[diaIdx]);
     // Prefer the Length column; else the last other populated dim.
     let len: number | null = null;
-    if (diaIdx !== LENGTH_IDX) len = dimValue(dims[LENGTH_IDX]);
+    if (diaIdx !== LENGTH_IDX) len = posDimValue(dims[LENGTH_IDX]);
     if (len == null) {
       for (let i = dims.length - 1; i >= 0; i--) {
         if (i === diaIdx) continue;
-        const v = dimValue(dims[i]);
+        const v = posDimValue(dims[i]);
         if (v != null) { len = v; break; }
       }
     }
@@ -86,9 +86,32 @@ export function pieceWeightKg(item: ItemDims): number | null {
     return dia * dia * len * rectFactor * ROUND_RATIO;
   }
 
-  const t = dimValue(item.thicknessRaw);
-  const h = dimValue(item.heightRaw);
-  const l = dimValue(item.lengthRaw);
+  const t = posDimValue(item.thicknessRaw);
+  const h = posDimValue(item.heightRaw);
+  const l = posDimValue(item.lengthRaw);
   if (t == null || h == null || l == null) return null;
   return t * h * l * rectFactor;
+}
+
+/** A dimension of zero (or negative) means "not entered", never "0 mm".
+ *  Returning 0 kg here poisoned RM/kg: the client entered a rod as
+ *  127.00 × 0.00 × 36.00 (diameter in Thickness, no Ø) and the app showed
+ *  RM 250/kg for aluminium — 6.4× reality — because the rod weighed nothing
+ *  while its price still counted. Null makes the weight "incomplete", which
+ *  suppresses RM/kg and flags it instead of displaying a wrong number. */
+function posDimValue(raw: string | null | undefined): number | null {
+  const v = dimValue(raw);
+  return v != null && v > 0 ? v : null;
+}
+
+/** True when the material name says round stock but no dim carries a Ø —
+ *  the exact entry mistake behind the RM 250/kg screenshot. UI uses this to
+ *  prompt for the diameter. */
+export function looksLikeRoundStock(
+  materialType: string | null | undefined,
+  ...dims: Array<string | null | undefined>
+): boolean {
+  const m = (materialType ?? "").toUpperCase();
+  if (!/\b(ROD|BAR|SHAFT)\b/.test(m)) return false;
+  return !isRoundItem(...dims);
 }

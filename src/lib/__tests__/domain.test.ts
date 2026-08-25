@@ -1,8 +1,10 @@
 import { describe, it, expect } from "vitest";
 import { parseDim, dimsMatch, isRoundItem } from "../dimensions";
-import { densityFor, pieceWeightKg } from "../weight";
+import { densityFor, pieceWeightKg, looksLikeRoundStock } from "../weight";
 import { suggestSuppliers, type MaterialGroup } from "../supplierMatch";
-import { buildMaterialEmail, buildGeneralEmail, gmailComposeUrl } from "../email";
+import {
+  buildMaterialEmail, buildGeneralEmail, gmailComposeUrl, mailtoUrl, ensureRfqPrefix,
+} from "../email";
 import { analyseQuotes, byRmPerKg, type InquiryItem } from "../compare";
 import { parseNumber, parseQty, parsePrice } from "../num";
 
@@ -88,6 +90,52 @@ describe("weight — formulas from the spec workbook", () => {
   it("unknown material defaults to the steel constant", () => {
     expect(densityFor("mystery metal")).toBe(8.0);
   });
+
+  it("a zero dimension means NOT weighable — never 0 kg (client's RM 250/kg bug)", () => {
+    // Entered exactly as in their screenshot: diameter in Thickness, no Ø.
+    expect(pieceWeightKg({ materialType: "ALU 6061 ROD", thicknessRaw: "127.00", heightRaw: "0.00", lengthRaw: "36.00" }))
+      .toBeNull();
+    expect(pieceWeightKg({ materialType: "SS 304", thicknessRaw: "0", heightRaw: "50", lengthRaw: "200" }))
+      .toBeNull();
+    // Round path too: Ø with a zero length is not weighable.
+    expect(pieceWeightKg({ materialType: "440C", thicknessRaw: "Ø50", heightRaw: "", lengthRaw: "0.00" }))
+      .toBeNull();
+  });
+
+  it("looksLikeRoundStock flags ROD/BAR/SHAFT names missing a Ø", () => {
+    expect(looksLikeRoundStock("ALU 6061 ROD", "127.00", "0.00", "36.00")).toBe(true);
+    expect(looksLikeRoundStock("ALU 6061 ROD", "Ø127.00", "", "36.00")).toBe(false);
+    expect(looksLikeRoundStock("SS 304", "2.0", "3.0", "5.0")).toBe(false);
+  });
+});
+
+describe("analyseQuotes — client screenshot regression (RM 250/kg for aluminium)", () => {
+  // RFQ "6061 PLATE; ref: SO26-08453 (5)(6)", supplier BXXX Sdn Bhd, 20 Aug.
+  const inquiry: InquiryItem[] = [
+    { id: "p", materialType: "ALU 6061 PLATE", thicknessRaw: "(3.00)", heightRaw: "(122.00)", lengthRaw: "(122.00)", qty: 200, itemRef: "SO26-08453 (5)" },
+    { id: "r", materialType: "ALU 6061 ROD", thicknessRaw: "(127.00)", heightRaw: "0.00", lengthRaw: "(36.00)", qty: 100, itemRef: "SO26-08453 (6)" },
+  ];
+  const r = analyseQuotes(inquiry, [{
+    supplierName: "BXXX Sdn Bhd", notes: "",
+    items: [
+      { rfqItemId: "p", thicknessRaw: "(3.00)", heightRaw: "(122.00)", lengthRaw: "(122.00)", qty: 200, price: 22.5, notes: "" },
+      { rfqItemId: "r", thicknessRaw: "(127.00)", heightRaw: "0.00", lengthRaw: "(36.00)", qty: 100, price: 15.3, notes: "" },
+    ],
+  }]);
+  const s = r.suppliers[0];
+
+  it("total RM still counts every priced line", () => {
+    expect(s.total).toBeCloseTo(6030, 2);
+  });
+  it("RM/kg is suppressed instead of showing 250.08", () => {
+    // Before the fix: rod weighed 0 kg, total kg 24.112, RM/kg 250.08 shown.
+    expect(s.weightIncomplete).toBe(true);
+    expect(s.rmPerKg).toBeNull();
+    expect(s.issues.join(" ")).toMatch(/no computable weight/i);
+  });
+  it("ranking falls back to total RM, honestly labelled", () => {
+    expect(r.rankedBy).toBe("total");
+  });
 });
 
 const GROUPS: MaterialGroup[] = [
@@ -138,40 +186,69 @@ describe("supplierMatch — normalisation + aliases", () => {
   });
 });
 
-describe("email — v1 numbered-line format", () => {
+describe("email — v1 numbered lines + 20 Aug client feedback", () => {
   const items = [
     { materialType: "SS 304", thicknessRaw: "2.0", heightRaw: "3.0", lengthRaw: "5.0", qty: 3, itemRef: "SO26-08134 (1)" },
     { materialType: "SS304", thicknessRaw: "Ø4.00", heightRaw: "5.0", lengthRaw: "(3.50)", qty: 2, itemRef: "SO26-08134 (4)" },
   ];
-  const { body } = buildMaterialEmail("RFQ SO26-08134", items);
+  const em = buildMaterialEmail("SO26-08134", items);
 
+  it("subject auto-gains the RFQ prefix, without doubling", () => {
+    expect(em.subject).toBe("RFQ SO26-08134");
+    expect(ensureRfqPrefix("RFQ 6061 PLATE")).toBe("RFQ 6061 PLATE");
+    expect(ensureRfqPrefix("rfq lower")).toBe("rfq lower");
+    expect(ensureRfqPrefix("6061 PLATE")).toBe("RFQ 6061 PLATE");
+  });
   it("uses numbered lines with X separators, not a padded table", () => {
-    expect(body).toContain("1. SS 304 2.0 X 3.0 X 5.0 = 3 PCS");
-    expect(body).not.toMatch(/ {3,}Material Type/);
+    expect(em.bodyForMail).toContain("1. SS 304 2.0 X 3.0 X 5.0 = 3 PCS");
+    expect(em.bodyForMail).not.toMatch(/ {3,}Material Type/);
   });
   it("preserves brackets and Ø verbatim", () => {
-    expect(body).toContain("Ø4.00");
-    expect(body).toContain("(3.50)");
+    expect(em.bodyForMail).toContain("Ø4.00");
+    expect(em.bodyForMail).toContain("(3.50)");
   });
-  it("keeps the legend, payment term and signature", () => {
-    expect(body).toContain("*(00.00) = order size in mm");
-    expect(body).toContain("Payment Term:");
-    expect(body).toContain("http://helixpoint.com.my");
+  it("frames the legend with horizontal rules", () => {
+    const rule = "-".repeat(46);
+    const idx = em.bodyForMail.indexOf("Please quote for the following:");
+    expect(em.bodyForMail.lastIndexOf(rule, idx)).toBeGreaterThan(-1);
+    expect(em.bodyForMail.indexOf(rule, idx)).toBeGreaterThan(idx);
   });
-  it("includes the per-item ref", () => {
-    expect(body).toContain("Ref: SO26-08134 (1)");
+  it("wraps the per-item ref in brackets", () => {
+    expect(em.bodyForMail).toContain("(Ref: SO26-08134 (1))");
   });
-  it("general RFQs use description lines", () => {
-    const g = buildGeneralEmail("RFQ Carbide", [
+  it("omits blank and zero dims — the client's rod line", () => {
+    const rod = buildMaterialEmail("x", [
+      { materialType: "ALU 6061 ROD", thicknessRaw: "127.00", heightRaw: "0.00", lengthRaw: "36.00", qty: 100, itemRef: "SO26-08453 (6)" },
+    ]);
+    expect(rod.bodyForMail).toContain("1. ALU 6061 ROD 127.00 X 36.00 = 100 PCS");
+    expect(rod.bodyForMail).not.toContain("0.00 X");
+  });
+  it("Copy body omits the signature; mail body includes it", () => {
+    expect(em.bodyForMail).toContain("Mobile: 011-5950 1559");
+    expect(em.bodyForMail).toContain("http://helixpoint.com.my");
+    expect(em.bodyForCopy).not.toContain("Mobile: 011-5950 1559");
+    expect(em.bodyForCopy).not.toContain("http://helixpoint.com.my");
+    expect(em.bodyForCopy).toContain("Payment Term:");
+    expect(em.bodyForCopy).toContain("Thank you.");
+  });
+  it("general RFQs use description lines and bracketed refs", () => {
+    const g = buildGeneralEmail("Carbide", [
       { description: "Carbide Tap Mill 2.500mm X 3.30mm", qty: 3, itemRef: "SO26-01101" },
     ]);
-    expect(g.body).toContain("1. Carbide Tap Mill 2.500mm X 3.30mm = 3 PCS   Ref: SO26-01101");
+    expect(g.subject).toBe("RFQ Carbide");
+    expect(g.bodyForMail).toContain("1. Carbide Tap Mill 2.500mm X 3.30mm = 3 PCS   (Ref: SO26-01101)");
+    expect(g.bodyForCopy).not.toContain("Mobile:");
   });
-  it("gmail compose URL carries to/su/body", () => {
+  it("gmail compose URL puts recipients in BCC, never to", () => {
     const url = gmailComposeUrl(["a@x.com", "b@y.com"], "RFQ Test", "Hello Ø");
     expect(url).toContain("mail.google.com");
-    expect(url).toContain("to=a%40x.com%2Cb%40y.com");
+    expect(url).toContain("bcc=a%40x.com%2Cb%40y.com");
+    expect(url).not.toContain("to=");
     expect(url).toContain("body=Hello+%C3%98");
+  });
+  it("mailto URL uses bcc with an empty to", () => {
+    const url = mailtoUrl(["a@x.com"], "S", "B");
+    expect(url.startsWith("mailto:?bcc=")).toBe(true);
   });
 });
 
