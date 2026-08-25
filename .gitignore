@@ -39,3 +39,6 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# Client feedback docs are kept out of this repo — it is public.
+docs/feedback-*.md
