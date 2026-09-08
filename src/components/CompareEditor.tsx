@@ -16,7 +16,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useSearchParams } from "next/navigation";
 import { supabase } from "@/lib/supabase/client";
-import type { RfqKind, RfqRow, RfqItemRow, QuoteRow, QuoteItemRow, SupplierRow } from "@/lib/types";
+import type { RfqKind, RfqRow, RfqItemRow, QuoteRow, QuoteItemRow, SupplierRow, QuoteAttachmentRow } from "@/lib/types";
 import { analyseQuotes, byRmPerKg, type ComparisonResult, type SupplierAnalysis } from "@/lib/compare";
 import { parseQty, parsePrice } from "@/lib/num";
 import { debounce, syncRows, type SaveState } from "@/lib/persist";
@@ -40,7 +40,11 @@ interface QuoteDraft {
   notes: string;
   items: QuoteItemDraft[]; // parallel to rfq items
   knownItemIds: string[];
+  attachments: QuoteAttachmentRow[];
 }
+
+const ATTACH_BUCKET = "quotation-files";
+const ATTACH_MAX_BYTES = 10 * 1024 * 1024;
 
 const rm = (n: number) => "RM " + n.toFixed(2);
 
@@ -57,6 +61,8 @@ export default function CompareEditor({ kind }: { kind: RfqKind }) {
   const [saveState, setSaveState] = useState<SaveState>("idle");
   const [saveError, setSaveError] = useState("");
   const [pageError, setPageError] = useState("");
+  const [rfqStage, setRfqStage] = useState<"pr" | "review">("review");
+  const [attachBusy, setAttachBusy] = useState<string | null>(null);
   const [choice, setChoice] = useState("");
   const [awardMsg, setAwardMsg] = useState("");
   const [awarding, setAwarding] = useState(false);
@@ -93,22 +99,26 @@ export default function CompareEditor({ kind }: { kind: RfqKind }) {
     if (!id) { setItems([]); setQuotes([]); loading.current = false; return; }
 
     const sb = supabase();
-    const [{ data: its, error: e1 }, { data: qs, error: e2 }] = await Promise.all([
-      sb.from("rfq_items").select("*").eq("rfq_id", id).order("position"),
-      sb.from("quotes").select("*, quote_items(*)").eq("rfq_id", id).order("created_at"),
+    // Compare works on the PR REVIEW copy only — the buyer-corrected items.
+    const [{ data: hdr }, { data: its, error: e1 }, { data: qs, error: e2 }] = await Promise.all([
+      sb.from("rfqs").select("stage").eq("id", id).single(),
+      sb.from("rfq_items").select("*").eq("rfq_id", id).eq("stage", "review").order("position"),
+      sb.from("quotes").select("*, quote_items(*), quote_attachments(*)").eq("rfq_id", id).order("created_at"),
     ]);
     if (e1 || e2) {
       setPageError(e1?.message ?? e2?.message ?? "could not load");
       loading.current = false;
       return;
     }
+    setRfqStage(((hdr as { stage?: "pr" | "review" } | null)?.stage) ?? "review");
     const rfqItems = (its as RfqItemRow[]) ?? [];
     setItems(rfqItems);
-    type QuoteWithItems = QuoteRow & { quote_items: QuoteItemRow[] };
+    type QuoteWithItems = QuoteRow & { quote_items: QuoteItemRow[]; quote_attachments?: QuoteAttachmentRow[] };
     const loaded = ((qs ?? []) as QuoteWithItems[]).map((q) => ({
       id: q.id,
       supplierName: q.supplier_name,
       notes: q.notes,
+      attachments: (q.quote_attachments ?? []).slice().sort((a, b) => a.uploaded_at.localeCompare(b.uploaded_at)),
       knownItemIds: q.quote_items.map((x) => x.id),
       items: rfqItems.map((it) => {
         const qi = q.quote_items.find((x) => x.rfq_item_id === it.id);
@@ -244,7 +254,7 @@ export default function CompareEditor({ kind }: { kind: RfqKind }) {
   function addQuote() {
     touch();
     setQuotes((prev) => [...prev, {
-      supplierName: "", notes: "", knownItemIds: [],
+      supplierName: "", notes: "", knownItemIds: [], attachments: [],
       items: items.map((it) => blankQuoteItem(it, true)),
     }]);
   }
@@ -255,6 +265,7 @@ export default function CompareEditor({ kind }: { kind: RfqKind }) {
       supplierName: s.supplierName,
       notes: s.notes,
       knownItemIds: [],
+      attachments: [],
       items: items.map((it, k) => {
         const line = s.lines[k];
         if (!line) return blankQuoteItem(it, false);
@@ -284,6 +295,50 @@ export default function CompareEditor({ kind }: { kind: RfqKind }) {
     if (q.id && !confirm(`Remove ${q.supplierName || "this supplier"}'s quote?`)) return;
     touch();
     setQuotes((prev) => prev.filter((_, j) => j !== i));
+  }
+
+  // ---------- quotation attachments (phase 1: store + view) ----------
+  async function attachFile(i: number, file: File) {
+    const q = quotes[i];
+    if (!q.id) { setPageError("Type the supplier name and wait for Saved ✓ before attaching."); return; }
+    if (file.size > ATTACH_MAX_BYTES) { setPageError(`${file.name} is over 10 MB.`); return; }
+    setAttachBusy(q.id);
+    const sb = supabase();
+    const safe = file.name.replace(/[^\w.\-() ]+/g, "_");
+    const path = `${rfqId}/${q.id}/${crypto.randomUUID()}-${safe}`;
+    const up = await sb.storage.from(ATTACH_BUCKET).upload(path, file, { contentType: file.type || undefined });
+    if (up.error) { setPageError("Upload failed: " + up.error.message); setAttachBusy(null); return; }
+    const { data: userData } = await sb.auth.getUser();
+    const { data, error } = await sb.from("quote_attachments").insert({
+      quote_id: q.id, path, filename: file.name, mime: file.type, size: file.size,
+      uploaded_by: userData.user?.email ?? "",
+    }).select("*").single();
+    if (error || !data) {
+      await sb.storage.from(ATTACH_BUCKET).remove([path]);
+      setPageError("Could not record attachment: " + (error?.message ?? "unknown"));
+      setAttachBusy(null);
+      return;
+    }
+    setQuotes((prev) => prev.map((x, j) =>
+      j === i ? { ...x, attachments: [...x.attachments, data as QuoteAttachmentRow] } : x));
+    setPageError("");
+    setAttachBusy(null);
+  }
+
+  async function openAttachment(a: QuoteAttachmentRow) {
+    const { data, error } = await supabase().storage.from(ATTACH_BUCKET).createSignedUrl(a.path, 3600);
+    if (error || !data) { setPageError("Could not open file: " + (error?.message ?? "unknown")); return; }
+    window.open(data.signedUrl, "_blank", "noopener");
+  }
+
+  async function removeAttachment(i: number, a: QuoteAttachmentRow) {
+    if (!confirm(`Remove ${a.filename}?`)) return;
+    const sb = supabase();
+    const { error } = await sb.from("quote_attachments").delete().eq("id", a.id);
+    if (error) { setPageError(error.message); return; }
+    await sb.storage.from(ATTACH_BUCKET).remove([a.path]);
+    setQuotes((prev) => prev.map((x, j) =>
+      j === i ? { ...x, attachments: x.attachments.filter((y) => y.id !== a.id) } : x));
   }
 
   // ---------- analysis (always live — no Analyse latch) ----------
@@ -365,7 +420,7 @@ export default function CompareEditor({ kind }: { kind: RfqKind }) {
             {rfqs.length === 0 && <option value="">No RFQs yet</option>}
             {rfqs.map((r) => (
               <option key={r.id} value={r.id}>
-                {r.subject || "(no subject)"} — {new Date(r.created_at).toLocaleDateString()}
+                {(r.stage ?? "review") === "pr" ? "[PR] " : ""}{r.subject || "(no subject)"} — {new Date(r.created_at).toLocaleDateString()}
               </option>
             ))}
           </select>
@@ -382,12 +437,25 @@ export default function CompareEditor({ kind }: { kind: RfqKind }) {
       </div>
 
       {pageError && <div className="flag" role="alert">{pageError}</div>}
-      {rfqId && items.length === 0 && (
-        <div className="text-sm text-gray-500">This RFQ has no items yet.</div>
+      {rfqId && rfqStage === "pr" && (
+        <div className="flag">
+          This request is still a <b>Purchase Requisition</b> — it has not been sent to PR
+          Review yet, so there is nothing to compare. Open it on the RFQ tab and press
+          <b> Send to PR Review</b>.
+        </div>
+      )}
+      {rfqId && rfqStage !== "pr" && items.length === 0 && (
+        <div className="text-sm text-gray-500">This RFQ has no reviewed items yet.</div>
+      )}
+      {rfqId && rfqStage !== "pr" && (
+        <p className="hint">
+          Upload each supplier&apos;s quotation (PDF or photo) to keep it with the quote and
+          read it while typing the prices.
+        </p>
       )}
 
       {/* Quote entry */}
-      {quotes.map((q, i) => (
+      {rfqStage !== "pr" && quotes.map((q, i) => (
         <div key={q.id ?? `new-${i}`} className="card space-y-2">
           <div className="flex gap-2 items-end flex-wrap">
             <div className="flex-1 min-w-52">
@@ -424,6 +492,26 @@ export default function CompareEditor({ kind }: { kind: RfqKind }) {
               Give this supplier a name — unnamed quotes are not saved.
             </div>
           )}
+          <div className="flex gap-2 flex-wrap items-center text-xs">
+            <span className="text-gray-500">📎 Quotation file:</span>
+            {q.attachments.map((a) => (
+              <span key={a.id} className="inline-flex items-center gap-1 bg-blue-50 border border-blue-200 rounded-full px-2 py-0.5">
+                <button onClick={() => openAttachment(a)} className="text-blue-700 underline" title={`${(a.size / 1024).toFixed(0)} KB · ${a.uploaded_by}`}>
+                  {a.filename}
+                </button>
+                <button onClick={() => removeAttachment(i, a)} aria-label={`Remove ${a.filename}`} className="text-red-400 hover:text-red-600 px-1">✕</button>
+              </span>
+            ))}
+            <label className={`btn-ghost text-xs cursor-pointer ${!q.id || attachBusy === q.id ? "opacity-50" : ""}`}>
+              {attachBusy === q.id ? "Uploading…" : "+ Attach PDF / photo"}
+              <input
+                type="file" accept=".pdf,image/*" className="hidden"
+                disabled={!q.id || attachBusy === q.id}
+                onChange={(e) => { const f = e.target.files?.[0]; if (f) attachFile(i, f); e.target.value = ""; }}
+              />
+            </label>
+            {!q.id && <span className="text-gray-400">(available after the first save)</span>}
+          </div>
           <div className="overflow-x-auto">
             <table className="w-full text-sm min-w-[640px]">
               <thead className="text-left text-xs text-gray-500">

@@ -16,9 +16,8 @@ Excel improvement spec ("Procurement Desk (1).xlsx"): Next.js + Supabase
    Normalised RM/kg, Spec Match. Claude's Choice (recommendation) vs Purchaser's Choice
    (final) → Award writes Purchase History.
 4. **Quote Comparison (General)** — simple totals comparison + award.
-5. **Supplier Scorecard** — weighted 1–5 ratings, team-shared.
-6. **Supplier List** — master data: material groups → ordered suppliers (order = suggestion priority).
-7. **Purchase History** — auto-filled on award, fully editable.
+5. **Supplier List** — master data: material groups → ordered suppliers (order = suggestion priority).
+6. **Purchase History** — auto-filled on award, fully editable.
 
 Weight formulas (from the Excel): rect `T×H×L×0.000008`, round `Ø²×L×0.0000066`
 (steel constants, scaled by material density; plastics get no RM/kg).

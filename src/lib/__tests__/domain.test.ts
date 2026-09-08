@@ -184,6 +184,19 @@ describe("supplierMatch — normalisation + aliases", () => {
   it("unknown material returns empty", () => {
     expect(suggestSuppliers("UNOBTAINIUM X99", GROUPS)).toEqual([]);
   });
+
+  // Client, 25 Aug: "只要有6061，它就要出來" — anything containing 6061 must hit
+  // the 6061 suppliers, with or without "Alu", with or without a form word.
+  it("'6061 flat bar' finds the ALU 6061 group (regression)", () => {
+    expect(suggestSuppliers("6061 flat bar", GROUPS)[0]?.name).toBe("YanKong");
+    expect(suggestSuppliers("6061 FLAT BAR", GROUPS)[0]?.name).toBe("YanKong");
+    expect(suggestSuppliers("6061 plate", GROUPS)[0]?.name).toBe("YanKong");
+    expect(suggestSuppliers("6061", GROUPS)[0]?.name).toBe("YanKong");
+  });
+  it("short generic tokens do not match everything", () => {
+    expect(suggestSuppliers("MS", GROUPS)).toEqual([]);
+    expect(suggestSuppliers("BAR", GROUPS)).toEqual([]);
+  });
 });
 
 describe("email — v1 numbered lines + 20 Aug client feedback", () => {

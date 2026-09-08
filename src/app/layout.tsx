@@ -16,7 +16,7 @@ const geistMono = Geist_Mono({
 
 export const metadata: Metadata = {
   title: "Helix Point — Procurement Desk",
-  description: "RFQ · Quote Comparison · Supplier Scorecard · Purchase History",
+  description: "RFQ · Quote Comparison · Purchase History",
 };
 
 export default function RootLayout({ children }: LayoutProps<"/">) {

@@ -11,9 +11,8 @@ const TABS = [
   { href: "/rfq/general", label: "2 · RFQ General" },
   { href: "/compare/material", label: "3 · Compare (Material)" },
   { href: "/compare/general", label: "4 · Compare (General)" },
-  { href: "/scorecard", label: "5 · Scorecard" },
-  { href: "/suppliers", label: "6 · Supplier List" },
-  { href: "/history", label: "7 · Purchase History" },
+  { href: "/suppliers", label: "5 · Supplier List" },
+  { href: "/history", label: "6 · Purchase History" },
 ];
 
 export default function Nav() {
@@ -31,7 +30,7 @@ export default function Nav() {
           <div>
             <h1 className="font-extrabold text-xl">🏭 Helix Point — Procurement Desk</h1>
             <p className="text-sm opacity-90">
-              RFQ · Quote Comparison · Supplier Scorecard — shared with your team.
+              RFQ · Quote Comparison · Purchase History — shared with your team.
             </p>
           </div>
           <div className="flex items-center gap-3 text-sm">

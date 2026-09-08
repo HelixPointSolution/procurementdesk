@@ -44,15 +44,41 @@ function expandQuery(materialType: string): string[] {
   return out;
 }
 
+/** Generic family prefixes that carry no grade information on their own. */
+const GENERIC_TOKENS = new Set(["ALU", "ALUMINIUM", "ALUMINUM", "SUS", "SS", "AISI"]);
+
+/** Alphanumeric tokens, uppercased: "6061 flat bar" → ["6061","FLAT","BAR"]. */
+function tokens(s: string): string[] {
+  return s.toUpperCase().split(/[^A-Z0-9]+/).filter(Boolean);
+}
+
+/** Tokens that identify a grade — drop family prefixes and short noise. */
+function significantTokens(s: string): string[] {
+  return tokens(s).filter((t) => !GENERIC_TOKENS.has(t) && t.length >= 3);
+}
+
 /**
- * Score a keyword against a query: 2 = exact (normalised), 1 = containment
- * (either direction, min 3 chars to avoid noise), 0 = no match.
+ * Score a keyword against a query:
+ *   2   = exact (normalised)
+ *   1.5 = every significant keyword token appears in the query — so the
+ *         keyword "ALU 6061" matches "6061 flat bar", "Alu 6061" and "6061".
+ *         (Client 25 Aug: "只要有6061，它就要出來" — anything containing 6061
+ *         must find the 6061 suppliers, regardless of Alu prefix or form.)
+ *   1   = whole-string containment (either direction, min 3 chars)
+ *   0   = no match
  */
 function scoreKeyword(keyword: string, query: string): number {
   const k = norm(keyword);
   const q = norm(query);
   if (k === "" || q === "") return 0;
   if (k === q) return 2;
+
+  const kt = significantTokens(keyword);
+  if (kt.length > 0) {
+    const qt = new Set(tokens(query));
+    if (kt.every((t) => qt.has(t))) return 1.5;
+  }
+
   if (q.length >= 3 && k.length >= 3 && (k.includes(q) || q.includes(k))) return 1;
   return 0;
 }

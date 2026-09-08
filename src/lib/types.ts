@@ -16,12 +16,16 @@ export interface SupplierMaterialRow {
 }
 
 export type RfqKind = "material" | "general";
+/** 'pr' = Purchase Requisition raised, not yet reviewed; 'review' = PR Review copy exists. */
+export type RfqStage = "pr" | "review";
 
 export interface RfqRow {
   id: string;
   kind: RfqKind;
   subject: string;
   payment_term: string;
+  stage: RfqStage;
+  sent_to_review_at: string | null;
   created_by: string;
   created_at: string;
 }
@@ -29,6 +33,7 @@ export interface RfqRow {
 export interface RfqItemRow {
   id: string;
   rfq_id: string;
+  stage: RfqStage;
   position: number;
   material_type: string | null;
   description: string | null;
@@ -58,6 +63,17 @@ export interface QuoteItemRow {
   qty: number | null;
   price: number | null;
   notes: string;
+}
+
+export interface QuoteAttachmentRow {
+  id: string;
+  quote_id: string;
+  path: string;
+  filename: string;
+  mime: string;
+  size: number;
+  uploaded_by: string;
+  uploaded_at: string;
 }
 
 export interface PurchaseHistoryRow {

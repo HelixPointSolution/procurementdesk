@@ -1,9 +1,16 @@
-# Roadmap — agreed 25 Aug 2026
+# Roadmap — updated 8 Sep 2026 (round 2 built, awaiting migrations)
 
-Round 1 (A1 + B + C, shipped alongside this file) covered: the zero-dimension
-RM/kg bug, RFQ subject prefix, BCC recipients + reminder, per-button signature
-handling, bracketed refs, legend framed with horizontal rules, and removing
-"Load example" from the RFQ tabs.
+Round 1 (A1 + B + C, commit f12c141) covered: the zero-dimension RM/kg bug, RFQ
+subject prefix, BCC recipients + reminder, per-button signature handling,
+bracketed refs, legend framed with horizontal rules, and removing "Load example"
+from the RFQ tabs.
+
+Round 2 (client feedback 25 Aug–8 Sep, built 8 Sep) covered: token-level
+supplier matching ("6061 flat bar" finds the 6061 group), Scorecard tab removed
+(table kept), Purchase Requisition -> PR Review two-block flow on both RFQ tabs
+(migration 003), and quotation attachments on the Compare tab (migration 004,
+Supabase Storage bucket `quotation-files`). Requires migrations 003 + 004 to be
+run BEFORE the build is used.
 
 This file is the hand-off plan for the next rounds. Written so a fresh session
 can continue without re-deriving context. Client said batching is fine — they
@@ -11,7 +18,14 @@ have not finished exploring (voice note 20 Aug 16:02).
 
 ---
 
-## D1 — Two-role workflow (production submits, admin approves & sends)
+## D1 — Two-role workflow — BUILT as a two-block flow, no roles (8 Sep)
+
+Shipped per the client's 3 Sep drawing: PR block + PR Review block on one page,
+`rfq_items.stage` ('pr'|'review'), `rfqs.stage`, email/Compare read the review
+copy. Roles remain OPTIONAL follow-up — the design below still applies if the
+client later wants requesters to have separate logins.
+
+### (original design, for the roles follow-up)
 
 **Client's words (20 Aug 17:20):** production downstairs types material/size/qty
 (may or may not have a reference) and presses Send; admin upstairs receives it,
@@ -52,7 +66,7 @@ Estimate: 1–2 days including tests.
 or photo), upload it and have the system pull the prices into the comparison.
 Explicitly NOT wanted on RFQ tabs — typing stays there.
 
-### Phase 1 — storage + viewing (no AI, no new accounts)
+### Phase 1 — storage + viewing — BUILT (8 Sep)
 - Supabase Storage bucket `quotation-files` (private; RLS: authenticated).
 - `quote_attachments` table: id, quote_id fk, path, filename, mime,
   uploaded_by, uploaded_at.
