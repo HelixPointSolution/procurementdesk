@@ -2,15 +2,17 @@
 
 /* Tabs 3 & 4 — Quote Comparison (Material / General).
  *
- * Handles what the client's spec demonstrates: suppliers quoting different
- * dimensions than asked (off-spec, flagged not hidden) and skipping items
- * entirely ("No stock for item 2").
+ * Upload-first (client request, 25 Sep 2026): the purchaser drops in the 2–3
+ * suppliers' quotations and the comparison appears. Each file is stored in the
+ * private quotation-files bucket, read by Claude (/api/extract-quote), and
+ * turned into a supplier card. The typing grid still exists for checking and
+ * correcting, but it sits collapsed under "Check / edit figures" instead of
+ * being the whole page.
  *
- * The tool recommends ("Claude's Choice") but the purchaser decides
- * ("always follow purchaser's choice"); Award writes Purchase History.
- *
- * Quotes persist through syncRows() rather than delete-and-reinsert, so a
- * failed save can no longer wipe quotes that were already stored.
+ * Unchanged underneath: suppliers may quote different dimensions than asked
+ * (off-spec, flagged) or skip items; the tool recommends ("Claude's Choice")
+ * but the purchaser decides; Award writes Purchase History. Edits persist
+ * through syncRows(), never delete-and-reinsert.
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -20,8 +22,12 @@ import type { RfqKind, RfqRow, RfqItemRow, QuoteRow, QuoteItemRow, SupplierRow, 
 import { analyseQuotes, byRmPerKg, type ComparisonResult, type SupplierAnalysis } from "@/lib/compare";
 import { parseQty, parsePrice } from "@/lib/num";
 import { debounce, syncRows, type SaveState } from "@/lib/persist";
+import {
+  mapExtraction, nameFromFilename, uniqueSupplierName,
+  type Extraction, type MappedLine,
+} from "@/lib/extract";
+import { prepareQuotationFile } from "@/lib/prepareUpload";
 import SaveIndicator from "./SaveIndicator";
-import { SAMPLE_MATERIAL_QUOTES, SAMPLE_GENERAL_QUOTES } from "@/lib/sample";
 
 interface QuoteItemDraft {
   id?: string;
@@ -41,10 +47,18 @@ interface QuoteDraft {
   items: QuoteItemDraft[]; // parallel to rfq items
   knownItemIds: string[];
   attachments: QuoteAttachmentRow[];
+  /** Things to double-check after automatic reading. Not persisted. */
+  warnings: string[];
+}
+
+interface UploadJob {
+  key: string;
+  filename: string;
+  status: "working" | "done" | "error";
+  message: string;
 }
 
 const ATTACH_BUCKET = "quotation-files";
-const ATTACH_MAX_BYTES = 10 * 1024 * 1024;
 
 const rm = (n: number) => "RM " + n.toFixed(2);
 
@@ -62,7 +76,8 @@ export default function CompareEditor({ kind }: { kind: RfqKind }) {
   const [saveError, setSaveError] = useState("");
   const [pageError, setPageError] = useState("");
   const [rfqStage, setRfqStage] = useState<"pr" | "review">("review");
-  const [attachBusy, setAttachBusy] = useState<string | null>(null);
+  const [jobs, setJobs] = useState<UploadJob[]>([]);
+  const [dragOver, setDragOver] = useState(false);
   const [choice, setChoice] = useState("");
   const [awardMsg, setAwardMsg] = useState("");
   const [awarding, setAwarding] = useState(false);
@@ -70,6 +85,12 @@ export default function CompareEditor({ kind }: { kind: RfqKind }) {
   const knownQuoteIds = useRef<string[]>([]);
   const loading = useRef(false);
   const dirty = useRef(false);
+  /** Supplier names claimed by uploads still in flight, so two parallel
+   *  uploads from the same company get distinct names. */
+  const reservedNames = useRef<Set<string>>(new Set());
+  /** Latest quotes for code running across awaits (processFile). */
+  const quotesRef = useRef<QuoteDraft[]>([]);
+  useEffect(() => { quotesRef.current = quotes; }, [quotes]);
 
   // ---------- initial lists ----------
   useEffect(() => {
@@ -96,6 +117,7 @@ export default function CompareEditor({ kind }: { kind: RfqKind }) {
     setAwardMsg("");
     setChoice("");
     setSaveState("idle");
+    setJobs([]);
     if (!id) { setItems([]); setQuotes([]); loading.current = false; return; }
 
     const sb = supabase();
@@ -118,6 +140,7 @@ export default function CompareEditor({ kind }: { kind: RfqKind }) {
       id: q.id,
       supplierName: q.supplier_name,
       notes: q.notes,
+      warnings: [],
       attachments: (q.quote_attachments ?? []).slice().sort((a, b) => a.uploaded_at.localeCompare(b.uploaded_at)),
       knownItemIds: q.quote_items.map((x) => x.id),
       items: rfqItems.map((it) => {
@@ -250,35 +273,147 @@ export default function CompareEditor({ kind }: { kind: RfqKind }) {
 
   function touch() { dirty.current = true; }
 
-  // ---------- editing ----------
+  // ---------- upload → read → supplier card ----------
+  const setJob = (key: string, patch: Partial<UploadJob>) =>
+    setJobs((prev) => prev.map((j) => (j.key === key ? { ...j, ...patch } : j)));
+
+  /** One quotation file, end to end. Writes the quote straight to the
+   *  database (header, lines, attachment) and only then adds the finished
+   *  card to state, so a half-read file never shows up as a card. */
+  async function processFile(original: File) {
+    const key = crypto.randomUUID();
+    setJobs((prev) => [...prev, { key, filename: original.name, status: "working", message: "Preparing…" }]);
+
+    const prepared = await prepareQuotationFile(original);
+    if (!prepared.ok) { setJob(key, { status: "error", message: prepared.error }); return; }
+    const file = prepared.file;
+    const sb = supabase();
+
+    // 1. Store the file.
+    setJob(key, { message: "Uploading…" });
+    const safe = file.name.replace(/[^\w.\-() ]+/g, "_");
+    const path = `${rfqId}/${crypto.randomUUID()}-${safe}`;
+    const up = await sb.storage.from(ATTACH_BUCKET).upload(path, file, { contentType: file.type || undefined });
+    if (up.error) { setJob(key, { status: "error", message: "Upload failed: " + up.error.message }); return; }
+
+    // 2. Read it.
+    setJob(key, { message: "Reading the quotation… (usually under a minute)" });
+    let extraction: Extraction | null = null;
+    let readProblem = "";
+    try {
+      const { data: sess } = await sb.auth.getSession();
+      const res = await fetch("/api/extract-quote", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${sess.session?.access_token ?? ""}` },
+        body: JSON.stringify({ rfqId, path }),
+      });
+      const body = await res.json().catch(() => ({}));
+      if (res.ok && body.extraction) extraction = body.extraction as Extraction;
+      else if (body.error === "not_configured") readProblem = "Automatic reading is not switched on yet — type the prices under “Check / edit figures”.";
+      else readProblem = (body.error as string) || `Could not read the quotation (${res.status}).`;
+    } catch {
+      readProblem = "Could not reach the reader — type the prices under “Check / edit figures”.";
+    }
+
+    // 3. Build the card.
+    const itemsForMap = items.map((it) => ({
+      materialType: it.material_type ?? "",
+      description: it.description ?? "",
+      thicknessRaw: it.thickness_raw ?? "",
+      heightRaw: it.height_raw ?? "",
+      lengthRaw: it.length_raw ?? "",
+      qty: it.qty,
+      itemRef: it.item_ref ?? "",
+    }));
+    const fallbackName = nameFromFilename(original.name);
+    const mapped = extraction
+      ? mapExtraction(extraction, itemsForMap, fallbackName)
+      : {
+          supplierName: fallbackName, notes: "", warnings: [readProblem],
+          lines: items.map((it): MappedLine => ({ ...blankQuoteItem(it, false) })),
+        };
+
+    const taken = [...quotesRef.current.map((q) => q.supplierName), ...reservedNames.current];
+    const supplierName = uniqueSupplierName(mapped.supplierName, taken);
+    reservedNames.current.add(supplierName);
+
+    // 4. Persist header, lines and attachment.
+    setJob(key, { message: "Saving…" });
+    try {
+      const { data: userData } = await sb.auth.getUser();
+      const who = userData.user?.email ?? "";
+      const { data: qrow, error: qErr } = await sb.from("quotes").insert({
+        rfq_id: rfqId,
+        supplier_name: supplierName,
+        supplier_id: suppliers.find((s) => s.name.toLowerCase() === supplierName.toLowerCase())?.id ?? null,
+        notes: mapped.notes,
+      }).select("id").single();
+      if (qErr || !qrow) throw new Error(qErr?.message ?? "could not save the supplier");
+      const quoteId = qrow.id as string;
+
+      const lineRows = mapped.lines
+        .map((l, k) => ({ l, it: items[k] }))
+        .filter(({ l, it }) => l.quoted && !!it)
+        .map(({ l, it }) => ({
+          quote_id: quoteId,
+          rfq_item_id: it.id,
+          thickness_raw: isMaterial ? l.thicknessRaw : null,
+          height_raw: isMaterial ? l.heightRaw : null,
+          length_raw: isMaterial ? l.lengthRaw : null,
+          qty: parseQty(l.qty),
+          price: parsePrice(l.price),
+          notes: l.notes,
+        }));
+      const idByItem = new Map<string, string>();
+      if (lineRows.length > 0) {
+        const { data: inserted, error: liErr } = await sb.from("quote_items").insert(lineRows).select("id, rfq_item_id");
+        if (liErr) throw new Error(liErr.message);
+        for (const r of (inserted ?? []) as Array<{ id: string; rfq_item_id: string }>) idByItem.set(r.rfq_item_id, r.id);
+      }
+
+      const { data: att, error: attErr } = await sb.from("quote_attachments").insert({
+        quote_id: quoteId, path, filename: original.name, mime: file.type, size: file.size, uploaded_by: who,
+      }).select("*").single();
+      if (attErr || !att) throw new Error(attErr?.message ?? "could not record the file");
+
+      const card: QuoteDraft = {
+        id: quoteId,
+        supplierName,
+        notes: mapped.notes,
+        warnings: mapped.warnings,
+        attachments: [att as QuoteAttachmentRow],
+        knownItemIds: [...idByItem.values()],
+        items: items.map((it, k) => ({ ...mapped.lines[k], id: idByItem.get(it.id) })),
+      };
+      knownQuoteIds.current = [...knownQuoteIds.current, quoteId];
+      // Appended without touch(): it is already saved, so no autosave is needed.
+      setQuotes((prev) => [...prev, card]);
+      setJob(key, {
+        status: "done",
+        message: extraction
+          ? `Read as ${supplierName}${mapped.warnings.length ? " — please check the flagged points" : ""}`
+          : `Added as ${supplierName} — ${readProblem}`,
+      });
+    } catch (e) {
+      await sb.storage.from(ATTACH_BUCKET).remove([path]);
+      setJob(key, { status: "error", message: "Could not save: " + (e instanceof Error ? e.message : "unknown error") });
+    } finally {
+      reservedNames.current.delete(supplierName);
+    }
+  }
+
+  function handleFiles(list: FileList | null) {
+    if (!list || !rfqId || rfqStage === "pr") return;
+    Array.from(list).forEach((f) => { processFile(f); });
+  }
+
+  // ---------- manual editing ----------
   function addQuote() {
     touch();
     setQuotes((prev) => [...prev, {
-      supplierName: "", notes: "", knownItemIds: [], attachments: [],
+      supplierName: "", notes: "", knownItemIds: [], attachments: [], warnings: [],
       items: items.map((it) => blankQuoteItem(it, true)),
     }]);
-  }
-  function loadExampleQuotes() {
-    touch();
-    const src = isMaterial ? SAMPLE_MATERIAL_QUOTES : SAMPLE_GENERAL_QUOTES;
-    setQuotes(src.map((s) => ({
-      supplierName: s.supplierName,
-      notes: s.notes,
-      knownItemIds: [],
-      attachments: [],
-      items: items.map((it, k) => {
-        const line = s.lines[k];
-        if (!line) return blankQuoteItem(it, false);
-        const b = blankQuoteItem(it, true);
-        return {
-          ...b,
-          thicknessRaw: line.thicknessRaw ?? b.thicknessRaw,
-          heightRaw: line.heightRaw ?? b.heightRaw,
-          lengthRaw: line.lengthRaw ?? b.lengthRaw,
-          price: line.price,
-        };
-      }),
-    })));
   }
   function setQuote(i: number, patch: Partial<QuoteDraft>) {
     touch();
@@ -295,34 +430,10 @@ export default function CompareEditor({ kind }: { kind: RfqKind }) {
     if (q.id && !confirm(`Remove ${q.supplierName || "this supplier"}'s quote?`)) return;
     touch();
     setQuotes((prev) => prev.filter((_, j) => j !== i));
-  }
-
-  // ---------- quotation attachments (phase 1: store + view) ----------
-  async function attachFile(i: number, file: File) {
-    const q = quotes[i];
-    if (!q.id) { setPageError("Type the supplier name and wait for Saved ✓ before attaching."); return; }
-    if (file.size > ATTACH_MAX_BYTES) { setPageError(`${file.name} is over 10 MB.`); return; }
-    setAttachBusy(q.id);
-    const sb = supabase();
-    const safe = file.name.replace(/[^\w.\-() ]+/g, "_");
-    const path = `${rfqId}/${q.id}/${crypto.randomUUID()}-${safe}`;
-    const up = await sb.storage.from(ATTACH_BUCKET).upload(path, file, { contentType: file.type || undefined });
-    if (up.error) { setPageError("Upload failed: " + up.error.message); setAttachBusy(null); return; }
-    const { data: userData } = await sb.auth.getUser();
-    const { data, error } = await sb.from("quote_attachments").insert({
-      quote_id: q.id, path, filename: file.name, mime: file.type, size: file.size,
-      uploaded_by: userData.user?.email ?? "",
-    }).select("*").single();
-    if (error || !data) {
-      await sb.storage.from(ATTACH_BUCKET).remove([path]);
-      setPageError("Could not record attachment: " + (error?.message ?? "unknown"));
-      setAttachBusy(null);
-      return;
+    // The attachment rows cascade with the quote; the stored files do not.
+    if (q.attachments.length > 0) {
+      await supabase().storage.from(ATTACH_BUCKET).remove(q.attachments.map((a) => a.path));
     }
-    setQuotes((prev) => prev.map((x, j) =>
-      j === i ? { ...x, attachments: [...x.attachments, data as QuoteAttachmentRow] } : x));
-    setPageError("");
-    setAttachBusy(null);
   }
 
   async function openAttachment(a: QuoteAttachmentRow) {
@@ -331,17 +442,7 @@ export default function CompareEditor({ kind }: { kind: RfqKind }) {
     window.open(data.signedUrl, "_blank", "noopener");
   }
 
-  async function removeAttachment(i: number, a: QuoteAttachmentRow) {
-    if (!confirm(`Remove ${a.filename}?`)) return;
-    const sb = supabase();
-    const { error } = await sb.from("quote_attachments").delete().eq("id", a.id);
-    if (error) { setPageError(error.message); return; }
-    await sb.storage.from(ATTACH_BUCKET).remove([a.path]);
-    setQuotes((prev) => prev.map((x, j) =>
-      j === i ? { ...x, attachments: x.attachments.filter((y) => y.id !== a.id) } : x));
-  }
-
-  // ---------- analysis (always live — no Analyse latch) ----------
+  // ---------- analysis (always live) ----------
   const result: ComparisonResult | null = useMemo(() => {
     if (items.length === 0) return null;
     return analyseQuotes(
@@ -405,9 +506,12 @@ export default function CompareEditor({ kind }: { kind: RfqKind }) {
   }
 
   const rfq = rfqs.find((r) => r.id === rfqId);
+  const ready = !!rfqId && rfqStage !== "pr" && items.length > 0;
+  const working = jobs.some((j) => j.status === "working");
+  const analysisFor = (name: string) => result?.suppliers.find((s) => s.supplierName === name.trim());
 
   return (
-    <div className="space-y-4">
+    <div className="space-y-5">
       <div className="flex gap-3 items-end flex-wrap">
         <div>
           <label htmlFor="cmp-rfq" className="lbl">RFQ</label>
@@ -425,15 +529,7 @@ export default function CompareEditor({ kind }: { kind: RfqKind }) {
             ))}
           </select>
         </div>
-        {rfqId && (
-          <>
-            <button onClick={addQuote} className="btn-ghost text-sm">+ Supplier quotation</button>
-            {items.length > 0 && (
-              <button onClick={loadExampleQuotes} className="btn-ghost text-sm">📋 Load example</button>
-            )}
-            <SaveIndicator state={saveState} error={saveError} onRetry={() => persist(rfqId, quotes)} />
-          </>
-        )}
+        {rfqId && <SaveIndicator state={saveState} error={saveError} onRetry={() => persist(rfqId, quotes)} />}
       </div>
 
       {pageError && <div className="flag" role="alert">{pageError}</div>}
@@ -447,133 +543,173 @@ export default function CompareEditor({ kind }: { kind: RfqKind }) {
       {rfqId && rfqStage !== "pr" && items.length === 0 && (
         <div className="text-sm text-gray-500">This RFQ has no reviewed items yet.</div>
       )}
-      {rfqId && rfqStage !== "pr" && (
-        <p className="hint">
-          Upload each supplier&apos;s quotation (PDF or photo) to keep it with the quote and
-          read it while typing the prices.
-        </p>
+
+      {/* ---------- Step 1: upload ---------- */}
+      {ready && (
+        <div>
+          <div className="chart-title">1. Upload the suppliers&apos; quotations</div>
+          <label
+            onDragOver={(e) => { e.preventDefault(); setDragOver(true); }}
+            onDragLeave={() => setDragOver(false)}
+            onDrop={(e) => { e.preventDefault(); setDragOver(false); handleFiles(e.dataTransfer.files); }}
+            className={`block cursor-pointer rounded-xl border-2 border-dashed p-6 text-center transition ${
+              dragOver ? "border-blue-500 bg-blue-50" : "border-gray-300 bg-white hover:bg-gray-50"
+            }`}
+          >
+            <div className="text-3xl" aria-hidden>📄</div>
+            <div className="font-semibold mt-1">Drop quotations here, or click to choose</div>
+            <div className="hint mt-1">
+              One file per supplier — PDF or photo (JPG / PNG). Select 2 or 3 at once. The prices
+              are read automatically; check them before awarding.
+            </div>
+            <input
+              type="file" multiple accept=".pdf,image/jpeg,image/png,image/webp"
+              className="hidden"
+              onChange={(e) => { handleFiles(e.target.files); e.target.value = ""; }}
+            />
+          </label>
+
+          {jobs.length > 0 && (
+            <ul className="mt-2 space-y-1 text-sm" aria-live="polite">
+              {jobs.map((j) => (
+                <li key={j.key} className="flex gap-2 items-start">
+                  <span aria-hidden>{j.status === "working" ? "⏳" : j.status === "done" ? "✅" : "⚠️"}</span>
+                  <span>
+                    <b>{j.filename}</b> — <span className={j.status === "error" ? "text-red-700" : "text-gray-600"}>{j.message}</span>
+                  </span>
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
       )}
 
-      {/* Quote entry */}
-      {rfqStage !== "pr" && quotes.map((q, i) => (
-        <div key={q.id ?? `new-${i}`} className="card space-y-2">
-          <div className="flex gap-2 items-end flex-wrap">
-            <div className="flex-1 min-w-52">
-              <label htmlFor={`sup-${i}`} className="lbl">{i + 1}. Supplier name</label>
-              <input
-                id={`sup-${i}`}
-                value={q.supplierName}
-                onChange={(e) => setQuote(i, { supplierName: e.target.value })}
-                list="supplier-names"
-                placeholder="e.g. Lian Giap"
-                className="w-full fld text-sm font-medium"
-              />
-            </div>
-            <div className="flex-[2] min-w-56">
-              <label htmlFor={`note-${i}`} className="lbl">Supplier notes</label>
-              <input
-                id={`note-${i}`}
-                value={q.notes}
-                onChange={(e) => setQuote(i, { notes: e.target.value })}
-                placeholder="e.g. Ex-stock, valid till tomorrow"
-                className="w-full fld text-sm"
-              />
-            </div>
-            <button
-              onClick={() => removeQuote(i)}
-              aria-label={`Remove ${q.supplierName || "supplier"} quotation`}
-              className="text-red-400 hover:text-red-600 px-2 py-2"
-            >
-              ✕
-            </button>
-          </div>
-          {q.supplierName.trim() === "" && (
-            <div className="text-xs text-amber-700">
-              Give this supplier a name — unnamed quotes are not saved.
-            </div>
-          )}
-          <div className="flex gap-2 flex-wrap items-center text-xs">
-            <span className="text-gray-500">📎 Quotation file:</span>
-            {q.attachments.map((a) => (
-              <span key={a.id} className="inline-flex items-center gap-1 bg-blue-50 border border-blue-200 rounded-full px-2 py-0.5">
-                <button onClick={() => openAttachment(a)} className="text-blue-700 underline" title={`${(a.size / 1024).toFixed(0)} KB · ${a.uploaded_by}`}>
-                  {a.filename}
-                </button>
-                <button onClick={() => removeAttachment(i, a)} aria-label={`Remove ${a.filename}`} className="text-red-400 hover:text-red-600 px-1">✕</button>
-              </span>
-            ))}
-            <label className={`btn-ghost text-xs cursor-pointer ${!q.id || attachBusy === q.id ? "opacity-50" : ""}`}>
-              {attachBusy === q.id ? "Uploading…" : "+ Attach PDF / photo"}
-              <input
-                type="file" accept=".pdf,image/*" className="hidden"
-                disabled={!q.id || attachBusy === q.id}
-                onChange={(e) => { const f = e.target.files?.[0]; if (f) attachFile(i, f); e.target.value = ""; }}
-              />
-            </label>
-            {!q.id && <span className="text-gray-400">(available after the first save)</span>}
-          </div>
-          <div className="overflow-x-auto">
-            <table className="w-full text-sm min-w-[640px]">
-              <thead className="text-left text-xs text-gray-500">
-                <tr>
-                  <th scope="col" className="py-1 pr-2 w-16">Quoted?</th>
-                  <th scope="col" className="py-1 pr-2">Item</th>
-                  {isMaterial && (<>
-                    <th scope="col" className="py-1 pr-2">Thickness</th>
-                    <th scope="col" className="py-1 pr-2">Height</th>
-                    <th scope="col" className="py-1 pr-2">Length</th>
-                  </>)}
-                  <th scope="col" className="py-1 pr-2 w-16">Qty</th>
-                  <th scope="col" className="py-1 pr-2 w-24">Price/pc RM</th>
-                  <th scope="col" className="py-1">Item notes</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y">
-                {items.map((it, k) => {
-                  const qi = q.items[k];
-                  if (!qi) return null;
-                  const label = `${isMaterial ? it.material_type : it.description} item ${k + 1}`;
-                  return (
-                    <tr key={it.id} className={qi.quoted ? "" : "opacity-40"}>
-                      <td className="py-1 pr-2">
-                        <input
-                          type="checkbox"
-                          checked={qi.quoted}
-                          aria-label={`${label} quoted`}
-                          onChange={(e) => setQuoteItem(i, k, { quoted: e.target.checked })}
-                        />
-                      </td>
-                      <td className="py-1 pr-2 whitespace-nowrap">
-                        <b>Item {k + 1}</b>{" "}
-                        <span className="text-gray-500">{isMaterial ? it.material_type : it.description}</span>
-                      </td>
-                      {isMaterial && (<>
-                        <TdInput label={`${label} thickness`} value={qi.thicknessRaw} disabled={!qi.quoted} inquiry={it.thickness_raw} onChange={(v) => setQuoteItem(i, k, { thicknessRaw: v })} />
-                        <TdInput label={`${label} height`} value={qi.heightRaw} disabled={!qi.quoted} inquiry={it.height_raw} onChange={(v) => setQuoteItem(i, k, { heightRaw: v })} />
-                        <TdInput label={`${label} length`} value={qi.lengthRaw} disabled={!qi.quoted} inquiry={it.length_raw} onChange={(v) => setQuoteItem(i, k, { lengthRaw: v })} />
-                      </>)}
-                      <TdInput label={`${label} quantity`} value={qi.qty} disabled={!qi.quoted} onChange={(v) => setQuoteItem(i, k, { qty: v })} />
-                      <TdInput label={`${label} price`} value={qi.price} disabled={!qi.quoted} invalid={qi.quoted && qi.price.trim() !== "" && parsePrice(qi.price) == null} onChange={(v) => setQuoteItem(i, k, { price: v })} />
-                      <TdInput label={`${label} notes`} value={qi.notes} disabled={!qi.quoted} onChange={(v) => setQuoteItem(i, k, { notes: v })} placeholder="e.g. Quoted 3mm" />
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
-          </div>
+      {/* ---------- Step 2: suppliers ---------- */}
+      {ready && quotes.length > 0 && (
+        <div className="space-y-2">
+          <div className="chart-title">2. Suppliers</div>
+          {quotes.map((q, i) => {
+            const a = analysisFor(q.supplierName);
+            return (
+              <div key={q.id ?? `new-${i}`} className="card space-y-2">
+                <div className="flex gap-3 items-center flex-wrap">
+                  <input
+                    aria-label={`Supplier ${i + 1} name`}
+                    value={q.supplierName}
+                    onChange={(e) => setQuote(i, { supplierName: e.target.value })}
+                    list="supplier-names"
+                    placeholder="Supplier name"
+                    className="fld text-sm font-semibold flex-1 min-w-48"
+                  />
+                  <span className="text-sm">
+                    {a && a.pricedCount > 0
+                      ? <><b>{rm(a.total)}</b> <span className="text-gray-500">· {a.quotedCount}/{items.length} items</span></>
+                      : <span className="text-gray-500">no prices yet</span>}
+                  </span>
+                  {q.attachments.map((f) => (
+                    <button key={f.id} onClick={() => openAttachment(f)} className="text-xs text-blue-700 underline" title="Open the quotation">
+                      📎 {f.filename}
+                    </button>
+                  ))}
+                  <button
+                    onClick={() => removeQuote(i)}
+                    aria-label={`Remove ${q.supplierName || "supplier"}`}
+                    className="text-red-400 hover:text-red-600 px-2 py-1 ml-auto"
+                  >
+                    ✕
+                  </button>
+                </div>
+
+                {q.supplierName.trim() === "" && (
+                  <div className="text-xs text-amber-700">Give this supplier a name — unnamed quotes are not saved.</div>
+                )}
+                {q.warnings.length > 0 && (
+                  <div className="flag mt-0">{q.warnings.map((w) => <div key={w}>⚠ {w}</div>)}</div>
+                )}
+                {q.notes && <div className="text-xs text-gray-600">{q.notes}</div>}
+
+                <details>
+                  <summary className="text-sm text-blue-700 cursor-pointer select-none">Check / edit figures</summary>
+                  <div className="mt-2 space-y-2">
+                    <div>
+                      <label htmlFor={`note-${i}`} className="lbl">Supplier notes</label>
+                      <input
+                        id={`note-${i}`}
+                        value={q.notes}
+                        onChange={(e) => setQuote(i, { notes: e.target.value })}
+                        placeholder="e.g. Ex-stock, valid till tomorrow"
+                        className="w-full fld text-sm"
+                      />
+                    </div>
+                    <div className="overflow-x-auto">
+                      <table className="w-full text-sm min-w-[640px]">
+                        <thead className="text-left text-xs text-gray-500">
+                          <tr>
+                            <th scope="col" className="py-1 pr-2 w-16">Quoted?</th>
+                            <th scope="col" className="py-1 pr-2">Item</th>
+                            {isMaterial && (<>
+                              <th scope="col" className="py-1 pr-2">Thickness</th>
+                              <th scope="col" className="py-1 pr-2">Height</th>
+                              <th scope="col" className="py-1 pr-2">Length</th>
+                            </>)}
+                            <th scope="col" className="py-1 pr-2 w-16">Qty</th>
+                            <th scope="col" className="py-1 pr-2 w-24">Price/pc RM</th>
+                            <th scope="col" className="py-1">Item notes</th>
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y">
+                          {items.map((it, k) => {
+                            const qi = q.items[k];
+                            if (!qi) return null;
+                            const label = `${isMaterial ? it.material_type : it.description} item ${k + 1}`;
+                            return (
+                              <tr key={it.id} className={qi.quoted ? "" : "opacity-40"}>
+                                <td className="py-1 pr-2">
+                                  <input
+                                    type="checkbox"
+                                    checked={qi.quoted}
+                                    aria-label={`${label} quoted`}
+                                    onChange={(e) => setQuoteItem(i, k, { quoted: e.target.checked })}
+                                  />
+                                </td>
+                                <td className="py-1 pr-2 whitespace-nowrap">
+                                  <b>Item {k + 1}</b>{" "}
+                                  <span className="text-gray-500">{isMaterial ? it.material_type : it.description}</span>
+                                </td>
+                                {isMaterial && (<>
+                                  <TdInput label={`${label} thickness`} value={qi.thicknessRaw} disabled={!qi.quoted} inquiry={it.thickness_raw} onChange={(v) => setQuoteItem(i, k, { thicknessRaw: v })} />
+                                  <TdInput label={`${label} height`} value={qi.heightRaw} disabled={!qi.quoted} inquiry={it.height_raw} onChange={(v) => setQuoteItem(i, k, { heightRaw: v })} />
+                                  <TdInput label={`${label} length`} value={qi.lengthRaw} disabled={!qi.quoted} inquiry={it.length_raw} onChange={(v) => setQuoteItem(i, k, { lengthRaw: v })} />
+                                </>)}
+                                <TdInput label={`${label} quantity`} value={qi.qty} disabled={!qi.quoted} onChange={(v) => setQuoteItem(i, k, { qty: v })} />
+                                <TdInput label={`${label} price`} value={qi.price} disabled={!qi.quoted} invalid={qi.quoted && qi.price.trim() !== "" && parsePrice(qi.price) == null} onChange={(v) => setQuoteItem(i, k, { price: v })} />
+                                <TdInput label={`${label} notes`} value={qi.notes} disabled={!qi.quoted} onChange={(v) => setQuoteItem(i, k, { notes: v })} placeholder="e.g. Quoted 3mm" />
+                              </tr>
+                            );
+                          })}
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+                </details>
+              </div>
+            );
+          })}
         </div>
-      ))}
+      )}
+      {ready && (
+        <button onClick={addQuote} disabled={working} className="text-sm text-blue-700 underline disabled:opacity-50">
+          + Add a supplier by typing instead
+        </button>
+      )}
       <datalist id="supplier-names">
         {suppliers.map((s) => <option key={s.id} value={s.name} />)}
       </datalist>
 
-      {/* ---------- Results ---------- */}
-      {result && result.suppliers.length > 0 && (
-        <div className="space-y-6 pt-2">
-          <Chart1 result={result} items={items} isMaterial={isMaterial} choice={choice} />
-          {isMaterial && <Chart2 result={result} />}
-          {isMaterial && <Chart3 result={result} items={items} />}
-
+      {/* ---------- Step 3: result ---------- */}
+      {ready && result && result.suppliers.length > 0 && (
+        <div className="space-y-4 pt-1">
+          <div className="chart-title">3. Result</div>
           <div className="verdict">
             <div className="text-xs uppercase tracking-wide text-gray-600">Claude&apos;s Choice</div>
             <h3 className="font-bold text-lg">
@@ -611,6 +747,20 @@ export default function CompareEditor({ kind }: { kind: RfqKind }) {
             </div>
             {rfq && <div className="text-xs text-gray-500 mt-1">Ref: {rfq.subject}</div>}
           </div>
+
+          <Chart1 result={result} items={items} isMaterial={isMaterial} choice={choice} />
+
+          {isMaterial && (
+            <details>
+              <summary className="text-sm text-blue-700 cursor-pointer select-none">
+                More detail — price per kg and size match
+              </summary>
+              <div className="space-y-6 mt-3">
+                <Chart2 result={result} />
+                <Chart3 result={result} items={items} />
+              </div>
+            </details>
+          )}
         </div>
       )}
     </div>
@@ -648,7 +798,7 @@ function Chart1({
 }) {
   return (
     <div>
-      <div className="chart-title">CHART 1 — As Quoted</div>
+      <div className="chart-title">Side by side — as quoted</div>
       <div className="overflow-x-auto tbl-wrap">
         <table className="w-full text-sm">
           <thead>
@@ -702,7 +852,7 @@ function Chart2({ result }: { result: ComparisonResult }) {
   const rows = result.suppliers.slice().sort(byRmPerKg);
   return (
     <div>
-      <div className="chart-title">CHART 2 — Normalised RM/kg (the fair ruler)</div>
+      <div className="chart-title">Normalised RM/kg (the fair ruler)</div>
       <div className="overflow-x-auto tbl-wrap">
         <table className="w-full text-sm">
           <thead>
@@ -741,7 +891,7 @@ function Chart2({ result }: { result: ComparisonResult }) {
 function Chart3({ result, items }: { result: ComparisonResult; items: RfqItemRow[] }) {
   return (
     <div>
-      <div className="chart-title">CHART 3 — Closest to Inquiry (spec match)</div>
+      <div className="chart-title">Closest to what we asked (size match)</div>
       {items.map((it, k) => (
         <div key={it.id} className="mb-4">
           <div className="hint mb-1">

@@ -75,7 +75,13 @@ Explicitly NOT wanted on RFQ tabs — typing stays there.
   prices as today.
 - Estimate: half a day.
 
-### Phase 2 — AI extraction (needs user's go-ahead on billing)
+### Phase 2 — AI extraction — BUILT 25 Sep 2026 (upload-first Compare tab)
+
+Shipped as `src/app/api/extract-quote/route.ts` + `src/lib/extract.ts`: claude-opus-5,
+structured output (EXTRACTION_SCHEMA), `fallbacks: "default"`. Activates when
+ANTHROPIC_API_KEY is set on Vercel; otherwise uploads fall back to manual entry.
+
+#### (original design notes)
 - Requires a vision-capable model API (e.g. Claude API) — API key + per-call
   cost. Key must live server-side: a Next.js route handler or Supabase Edge
   Function takes the storage path, sends the file, returns structured
