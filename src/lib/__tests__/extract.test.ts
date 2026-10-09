@@ -11,7 +11,7 @@ const ITEMS: ExtractionRfqItem[] = [
 ];
 
 const line = (over: Partial<Extraction["lines"][number]>): Extraction["lines"][number] => ({
-  item_number: 1, description: "", thickness: "", height: "", length: "",
+  item_number: 1, description: "", material: "", thickness: "", height: "", length: "",
   qty: "", unit_price: "", line_note: "", ...over,
 });
 
@@ -56,7 +56,8 @@ describe("mapExtraction", () => {
       ],
     }, ITEMS, "file");
     expect(m.supplierName).toBe("AXXX Sdn Bhd");
-    expect(m.lines[0]).toMatchObject({ quoted: true, price: "25", thicknessRaw: "3.0", heightRaw: "20.30" });
+    // Height was not stated by the supplier: stays blank, never copied from the RFQ.
+    expect(m.lines[0]).toMatchObject({ quoted: true, price: "25", thicknessRaw: "3.0", heightRaw: "" });
     expect(m.lines[1]).toMatchObject({ quoted: true, price: "16.38" });
     expect(m.warnings).toEqual([]);
   });
@@ -70,11 +71,32 @@ describe("mapExtraction", () => {
     expect(m.notes).toContain("Item 2: No stock");
   });
 
-  it("marks an item the supplier never mentioned as not quoted, with the inquiry size", () => {
+  it("marks an item the supplier never mentioned as not quoted, with nothing pre-filled", () => {
     const m = mapExtraction({
       supplier_name: "BXXX", currency: "RM", notes: "", lines: [line({ item_number: 1, unit_price: "22.5" })],
     }, ITEMS, "file");
-    expect(m.lines[1]).toMatchObject({ quoted: false, price: "", thicknessRaw: "8.00", qty: "400" });
+    // Client, 25 Sep: sizes must never be auto-filled from the RFQ.
+    expect(m.lines[1]).toMatchObject({ quoted: false, price: "", thicknessRaw: "", heightRaw: "", qty: "" });
+  });
+
+  it("keeps the supplier's own sizes even when they differ from the RFQ", () => {
+    const m = mapExtraction({
+      supplier_name: "X", currency: "RM", notes: "",
+      lines: [line({ item_number: 1, unit_price: "9.5", thickness: "18.00", height: "26.00", length: "150.00" })],
+    }, ITEMS, "file");
+    expect(m.lines[0]).toMatchObject({ thicknessRaw: "18.00", heightRaw: "26.00", lengthRaw: "150.00" });
+  });
+
+  it("notes a substituted grade, but not an obvious match", () => {
+    const m = mapExtraction({
+      supplier_name: "ASCO", currency: "RM", notes: "",
+      lines: [
+        line({ item_number: 1, unit_price: "15", material: "MS/S275JR" }),
+        line({ item_number: 2, unit_price: "24", material: "1.2083" }),
+      ],
+    }, ITEMS, "file");
+    expect(m.lines[0].notes).not.toMatch(/Offered/);
+    expect(m.lines[1].notes).toContain("Offered 1.2083");
   });
 
   it("parses prices with thousands separators", () => {

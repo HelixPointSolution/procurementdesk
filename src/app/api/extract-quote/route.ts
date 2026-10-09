@@ -19,10 +19,8 @@
 
 import Anthropic from "@anthropic-ai/sdk";
 import { createClient } from "@supabase/supabase-js";
-import {
-  buildExtractionPrompt, EXTRACTABLE_TYPES, EXTRACTION_SCHEMA,
-  type Extraction, type ExtractionRfqItem,
-} from "@/lib/extract";
+import { EXTRACTABLE_TYPES, type ExtractionRfqItem } from "@/lib/extract";
+import { extractQuotation } from "@/lib/claudeExtract";
 
 // A multi-page PDF with adaptive thinking can take a minute or more.
 export const maxDuration = 300;
@@ -35,13 +33,6 @@ function mediaTypeFor(path: string, blobType: string): string {
   if (blobType && EXTRACTABLE_TYPES[blobType]) return blobType;
   const ext = path.toLowerCase().split(".").pop() ?? "";
   return ({ pdf: "application/pdf", jpg: "image/jpeg", jpeg: "image/jpeg", png: "image/png", webp: "image/webp", gif: "image/gif" } as Record<string, string>)[ext] ?? blobType;
-}
-
-function isExtraction(x: unknown): x is Extraction {
-  if (!x || typeof x !== "object") return false;
-  const o = x as Record<string, unknown>;
-  return typeof o.supplier_name === "string" && typeof o.currency === "string" &&
-    typeof o.notes === "string" && Array.isArray(o.lines);
 }
 
 export async function POST(request: Request) {
@@ -107,45 +98,16 @@ export async function POST(request: Request) {
   const data = Buffer.from(await blob.arrayBuffer()).toString("base64");
 
   // --- Claude -----------------------------------------------------------
-  const fileBlock: Anthropic.Beta.BetaContentBlockParam = kind === "pdf"
-    ? { type: "document", source: { type: "base64", media_type: "application/pdf", data } }
-    : {
-        type: "image",
-        source: { type: "base64", media_type: mediaType as "image/jpeg" | "image/png" | "image/webp" | "image/gif", data },
-      };
-
-  const client = new Anthropic();
   try {
-    const response = await client.beta.messages.create({
-      model: "claude-opus-5",
-      max_tokens: 16000,
-      // A declined request is re-run server-side on Anthropic's recommended
-      // fallback model instead of failing the upload.
-      betas: ["server-side-fallback-2026-07-01"],
-      fallbacks: "default",
-      output_config: { format: { type: "json_schema", schema: EXTRACTION_SCHEMA } },
-      messages: [{
-        role: "user",
-        content: [fileBlock, { type: "text", text: buildExtractionPrompt(items, isMaterial) }],
-      }],
-    });
-
-    if (response.stop_reason === "refusal") {
-      return Response.json({ error: "The quotation could not be read automatically." }, { status: 422 });
-    }
-    if (response.stop_reason === "max_tokens") {
-      return Response.json({ error: "The quotation was too long to read in one go." }, { status: 422 });
-    }
-
-    const text = response.content
-      .map((b) => (b.type === "text" ? b.text : ""))
-      .join("");
-    let parsed: unknown;
-    try { parsed = JSON.parse(text); } catch { parsed = null; }
-    if (!isExtraction(parsed)) {
-      return Response.json({ error: "The reader returned an unexpected result." }, { status: 422 });
-    }
-    return Response.json({ extraction: parsed });
+    const result = await extractQuotation({ data, mediaType, items, isMaterial });
+    if (result.ok) return Response.json({ extraction: result.extraction });
+    const message = {
+      refusal: "The quotation could not be read automatically.",
+      too_long: "The quotation was too long to read in one go.",
+      bad_output: "The reader returned an unexpected result.",
+      unsupported_type: "Only PDF, JPG, PNG or WebP files can be read automatically.",
+    }[result.failure.kind];
+    return Response.json({ error: message }, { status: result.failure.kind === "unsupported_type" ? 415 : 422 });
   } catch (err) {
     if (err instanceof Anthropic.AuthenticationError) {
       return Response.json({ error: "The AI key is invalid — check ANTHROPIC_API_KEY." }, { status: 503 });

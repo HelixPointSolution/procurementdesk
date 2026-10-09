@@ -27,6 +27,8 @@ export interface ExtractionLine {
   /** 1-based RFQ item this line answers; 0 when it matches none. */
   item_number: number;
   description: string;
+  /** Grade the supplier offered, e.g. "S275JR", "1.2083". */
+  material: string;
   thickness: string;
   height: string;
   length: string;
@@ -67,11 +69,12 @@ export const EXTRACTION_SCHEMA = {
       items: {
         type: "object",
         additionalProperties: false,
-        required: ["item_number", "description", "thickness", "height", "length", "qty", "unit_price", "line_note"],
+        required: ["item_number", "description", "material", "thickness", "height", "length", "qty", "unit_price", "line_note"],
         properties: {
           item_number: { type: "integer", description: "1-based number of the RFQ item this line answers, 0 if it matches none." },
           description: { type: "string", description: "Material or item description as the supplier wrote it." },
-          thickness: { type: "string", description: "Thickness (or diameter, prefixed with Ø) as quoted. Empty for non-material items or if not shown." },
+          material: { type: "string", description: "Material grade the supplier is offering (e.g. S275JR, SUS420J2, 1.2083, ALU 6061). Empty for non-material items or if not shown." },
+          thickness: { type: "string", description: "Finished thickness (or diameter, prefixed with Ø) as quoted. Empty for non-material items or if not shown." },
           height: { type: "string", description: "Height / width as quoted. Empty if not applicable." },
           length: { type: "string", description: "Length as quoted. Empty if not applicable." },
           qty: { type: "string", description: "Quantity quoted, digits only. Empty if not shown." },
@@ -104,20 +107,36 @@ export function buildExtractionPrompt(items: ExtractionRfqItem[], isMaterial: bo
       `Copy dimensions as the supplier wrote them, keeping any brackets or Ø.\n`
     : "\n";
 
+  const rules = [
+    `Match every quoted line to the RFQ item it answers and give that item's number. ` +
+      `Match on ${isMaterial ? "material and size" : "description"}, not on line order — suppliers reorder, merge ` +
+      `and skip lines. A line that answers none of our items gets item number 0.`,
+    `unit_price is the full price for ONE finished piece. Suppliers often split one item across sub-lines ` +
+      `(the item itself, then machining, cutting or grinding charges): add those sub-lines together, give the sum, and ` +
+      `list the breakdown in line_note. If the supplier only gives a line total, divide by the quoted quantity and say ` +
+      `so in line_note. If the price is per kg or per metre, leave unit_price empty and put the rate in line_note — ` +
+      `never guess a per-piece figure.`,
+    `qty is the number of pieces actually being quoted. The Qty column sometimes shows 1.00 while the real quantity ` +
+      `sits in Remarks (for example "500 pcs") — use the real quantity. Ignore document totals that merely add up unit prices.`,
+    ...(isMaterial
+      ? [
+          `If the supplier gives both a finish size (F/S) and an order or raw size (O/S), put the finish size in ` +
+            `thickness/height/length and mention the order size in line_note.`,
+          `Record sizes exactly as the supplier quoted them, never copied from our list — suppliers often change ` +
+            `sizes and the purchaser needs to see what was really offered. If a size is not stated, leave it empty.`,
+          `Put the material grade the supplier actually offers in material, even when it differs from ours ` +
+            `(for example 1.2083 or SUS420J2 offered for STAVAX).`,
+        ]
+      : [`Leave material, thickness, height and length empty — these are not material items.`]),
+    `If an item is marked no stock, not available, or left unpriced, include it with an empty unit_price and explain in line_note.`,
+    `Use empty strings for anything the quotation does not show. Do not invent values.`,
+  ];
+
   return (
     `The attached file is a supplier's quotation replying to our request for quotation (RFQ). ` +
     `We asked for these items:\n\n${list}\n${notation}\n` +
     `Read the quotation and fill in the structured fields.\n\n` +
-    `- Match every quoted line to the RFQ item it answers and give that item's number. ` +
-    `Match on material and size, not on line order — suppliers reorder, merge and skip lines. ` +
-    `A line that answers none of our items gets item number 0.\n` +
-    `- unit_price is the price for ONE piece. If the supplier only gives a line total, divide by the quoted quantity ` +
-    `and say so in line_note. If the price is per kg or per metre, leave unit_price empty and put the rate in line_note ` +
-    `— never guess a per-piece figure.\n` +
-    `- If the supplier quoted a different size than we asked (for example 3mm thick instead of 2mm), record the size they ` +
-    `quoted, not ours, and mention the difference in line_note.\n` +
-    `- If an item is marked no stock, not available, or left unpriced, include it with an empty unit_price and explain in line_note.\n` +
-    `- Use empty strings for anything the quotation does not show. Do not invent values.`
+    rules.map((r) => `- ${r}`).join("\n")
   );
 }
 
@@ -166,25 +185,29 @@ export function mapExtraction(
     // First priced line wins when the model maps two lines to one item.
     const hits = ex.lines.filter((l) => l.item_number === k + 1);
     const hit = hits.find((l) => parsePrice(l.unit_price) != null) ?? hits[0];
+    // Client, 25 Sep: "我不要它自動從RFQ那邊" — never fill a supplier's sizes
+    // from our own RFQ. Suppliers change sizes, and a copied size would hide
+    // that. Whatever the quotation does not state stays blank.
     if (!hit) {
-      return {
-        quoted: false,
-        thicknessRaw: it.thicknessRaw, heightRaw: it.heightRaw, lengthRaw: it.lengthRaw,
-        qty: it.qty == null ? "" : String(it.qty),
-        price: "", notes: "",
-      };
+      return { quoted: false, thicknessRaw: "", heightRaw: "", lengthRaw: "", qty: "", price: "", notes: "" };
     }
     const price = parsePrice(hit.unit_price);
+    const qty = parseQty(hit.qty);
+    const offered = hit.material.trim();
+    const notes = [
+      offered && !sameGrade(offered, it.materialType) ? `Offered ${offered}` : "",
+      hit.line_note.trim(),
+    ].filter(Boolean).join(" · ");
     return {
       // A line the supplier addressed but did not price stays unticked, so it
       // cannot enter the totals — its note explains why.
       quoted: price != null,
-      thicknessRaw: hit.thickness.trim() || it.thicknessRaw,
-      heightRaw: hit.height.trim() || it.heightRaw,
-      lengthRaw: hit.length.trim() || it.lengthRaw,
-      qty: parseQty(hit.qty) != null ? String(parseQty(hit.qty)) : it.qty == null ? "" : String(it.qty),
+      thicknessRaw: hit.thickness.trim(),
+      heightRaw: hit.height.trim(),
+      lengthRaw: hit.length.trim(),
+      qty: qty == null ? "" : String(qty),
       price: price == null ? "" : String(price),
-      notes: hit.line_note.trim(),
+      notes,
     };
   });
 
@@ -210,6 +233,15 @@ export function mapExtraction(
     lines,
     warnings,
   };
+}
+
+/** True when the offered grade plainly is the requested one ("MS/S275JR"
+ *  answering "MS"); anything else is shown to the purchaser as "Offered …". */
+function sameGrade(offered: string, asked: string): boolean {
+  const n = (x: string) => x.toUpperCase().replace(/[^A-Z0-9]/g, "");
+  const a = n(asked), o = n(offered);
+  if (!a || !o) return true;
+  return o.includes(a) || a.includes(o);
 }
 
 /** "Lian Giap", taken → "Lian Giap (2)". Names key the comparison, so they must be unique. */

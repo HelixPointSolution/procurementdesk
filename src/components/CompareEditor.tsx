@@ -175,16 +175,12 @@ export default function CompareEditor({ kind }: { kind: RfqKind }) {
     loadRfq(target);
   }, [rfqs, requestedRfq, loadRfq]);
 
-  function blankQuoteItem(it: RfqItemRow, quoted: boolean): QuoteItemDraft {
-    return {
-      quoted,
-      thicknessRaw: it.thickness_raw ?? "",
-      heightRaw: it.height_raw ?? "",
-      lengthRaw: it.length_raw ?? "",
-      qty: it.qty == null ? "" : String(it.qty),
-      price: "",
-      notes: "",
-    };
+  /* Sizes start EMPTY, never copied from the RFQ (client, 25 Sep): suppliers
+   * often change sizes, and a pre-filled size hides that. The inquiry size
+   * still shows as the grey placeholder for reference. A blank qty is priced
+   * at the inquiry qty by the comparison engine. */
+  function blankQuoteItem(_it: RfqItemRow, quoted: boolean): QuoteItemDraft {
+    return { quoted, thicknessRaw: "", heightRaw: "", lengthRaw: "", qty: "", price: "", notes: "" };
   }
 
   // ---------- persistence ----------
@@ -681,7 +677,7 @@ export default function CompareEditor({ kind }: { kind: RfqKind }) {
                                   <TdInput label={`${label} height`} value={qi.heightRaw} disabled={!qi.quoted} inquiry={it.height_raw} onChange={(v) => setQuoteItem(i, k, { heightRaw: v })} />
                                   <TdInput label={`${label} length`} value={qi.lengthRaw} disabled={!qi.quoted} inquiry={it.length_raw} onChange={(v) => setQuoteItem(i, k, { lengthRaw: v })} />
                                 </>)}
-                                <TdInput label={`${label} quantity`} value={qi.qty} disabled={!qi.quoted} onChange={(v) => setQuoteItem(i, k, { qty: v })} />
+                                <TdInput label={`${label} quantity`} value={qi.qty} disabled={!qi.quoted} inquiry={it.qty == null ? null : String(it.qty)} onChange={(v) => setQuoteItem(i, k, { qty: v })} />
                                 <TdInput label={`${label} price`} value={qi.price} disabled={!qi.quoted} invalid={qi.quoted && qi.price.trim() !== "" && parsePrice(qi.price) == null} onChange={(v) => setQuoteItem(i, k, { price: v })} />
                                 <TdInput label={`${label} notes`} value={qi.notes} disabled={!qi.quoted} onChange={(v) => setQuoteItem(i, k, { notes: v })} placeholder="e.g. Quoted 3mm" />
                               </tr>
