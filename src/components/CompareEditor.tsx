@@ -4,7 +4,7 @@
  *
  * Upload-first (client request, 25 Sep 2026): the purchaser drops in the 2–3
  * suppliers' quotations and the comparison appears. Each file is stored in the
- * private quotation-files bucket, read by Claude (/api/extract-quote), and
+ * private quotation-files bucket, read by Gemini (/api/extract-quote), and
  * turned into a supplier card. The typing grid still exists for checking and
  * correcting, but it sits collapsed under "Check / edit figures" instead of
  * being the whole page.

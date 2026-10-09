@@ -11,8 +11,8 @@ Excel improvement spec ("Procurement Desk (1).xlsx"): Next.js + Supabase
    email (Copy / Open in Gmail / Mail app). Notation preserved verbatim:
    `(9.50)` = order size · `9.50` = finishing size (+5mm max allowance) · `Ø4.00` = diameter.
 2. **RFQ General** — non-material items: Description / Qty / Ref.
-3. **Quote Comparison (Material)** — upload the suppliers' quotations (PDF/photo); Claude reads
-   the prices into supplier cards (needs `ANTHROPIC_API_KEY`, see Setup). Per-supplier quotes; suppliers may quote different
+3. **Quote Comparison (Material)** — upload the suppliers' quotations (PDF/photo); Gemini (gemini-3.8-flash) reads
+   the prices into supplier cards (needs `GEMINI_API_KEY`, see Setup). Per-supplier quotes; suppliers may quote different
    dims (off-spec, flagged on every dimension) or skip items. Charts: As Quoted,
    Normalised RM/kg, Spec Match. Claude's Choice (recommendation) vs Purchaser's Choice
    (final) → Award writes Purchase History.
@@ -33,7 +33,7 @@ Note: the Excel's Ø50×200 example says "303 kg" — that's a decimal typo; cor
    turn OFF "Allow new users to sign up".
 4. **Create team accounts**: Dashboard → Authentication → Users → Add user
    (email + password, "Auto Confirm User" on).
-5. **(Optional) AI quotation reading**: add `ANTHROPIC_API_KEY` (from console.anthropic.com,
+5. **(Optional) AI quotation reading**: add `GEMINI_API_KEY` (a Google AI Studio key,
    billing enabled) to Vercel → Project → Settings → Environment Variables — server-side only,
    never prefix it with `NEXT_PUBLIC_`. Without it, uploads still attach the file and prices are typed by hand.
 6. **Configure keys**: copy Project URL + publishable (anon) key from

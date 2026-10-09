@@ -77,9 +77,9 @@ Explicitly NOT wanted on RFQ tabs — typing stays there.
 
 ### Phase 2 — AI extraction — BUILT 25 Sep 2026 (upload-first Compare tab)
 
-Shipped as `src/app/api/extract-quote/route.ts` + `src/lib/extract.ts`: claude-opus-5,
-structured output (EXTRACTION_SCHEMA), `fallbacks: "default"`. Activates when
-ANTHROPIC_API_KEY is set on Vercel; otherwise uploads fall back to manual entry.
+Shipped as `src/app/api/extract-quote/route.ts` + `src/lib/extract.ts` + `src/lib/quoteExtract.ts`:
+structured output (EXTRACTION_SCHEMA). Activates when
+GEMINI_API_KEY is set on Vercel; otherwise uploads fall back to manual entry. Switched from Claude to gemini-3.8-flash on 9 Oct 2026 at the owner's request.
 
 #### (original design notes)
 - Requires a vision-capable model API (e.g. Claude API) — API key + per-call

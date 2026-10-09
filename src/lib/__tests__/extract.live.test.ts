@@ -1,21 +1,21 @@
 /* Live check of quotation reading against real supplier quotations.
  *
  * Skipped unless BOTH are set:
- *   ANTHROPIC_API_KEY    — makes real (billed, a few cents per file) API calls
+ *   GEMINI_API_KEY       — makes real (billed) API calls
  *   QUOTE_FIXTURES_DIR   — folder holding the PDFs and cases.json
  *
  * The fixtures are client documents with real prices, so they live OUTSIDE
  * this repository (which is public). cases.json lists, per file, the per-piece
  * price and quantity a purchaser would read off it, plus the expected total.
  *
- *   ANTHROPIC_API_KEY=... QUOTE_FIXTURES_DIR=../_private/quote-fixtures \
+ *   GEMINI_API_KEY=... QUOTE_FIXTURES_DIR=../_private/quote-fixtures \
  *     npx vitest run src/lib/__tests__/extract.live.test.ts
  */
 
 import { describe, it, expect } from "vitest";
 import fs from "node:fs";
 import path from "node:path";
-import { extractQuotation } from "../claudeExtract";
+import { extractQuotation } from "../quoteExtract";
 import { mapExtraction, type ExtractionRfqItem } from "../extract";
 import { analyseQuotes } from "../compare";
 import { parsePrice, parseQty } from "../num";
@@ -34,7 +34,7 @@ interface Fixtures {
 }
 
 const dir = process.env.QUOTE_FIXTURES_DIR;
-const enabled = !!process.env.ANTHROPIC_API_KEY && !!dir && fs.existsSync(path.join(dir ?? "", "cases.json"));
+const enabled = !!process.env.GEMINI_API_KEY && !!dir && fs.existsSync(path.join(dir ?? "", "cases.json"));
 const fixtures: Fixtures | null = enabled
   ? JSON.parse(fs.readFileSync(path.join(dir as string, "cases.json"), "utf8"))
   : null;

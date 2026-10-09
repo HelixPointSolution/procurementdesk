@@ -1,4 +1,4 @@
-/* POST /api/extract-quote — read one supplier quotation with Claude.
+/* POST /api/extract-quote — read one supplier quotation with Gemini.
  *
  * Body: { rfqId: string, path: string }  (path = object in the quotation-files bucket)
  * Auth: the caller's Supabase access token as "Authorization: Bearer …".
@@ -6,28 +6,27 @@
  * The file is fetched from Supabase Storage here, server-side, under the
  * caller's own RLS policies — so a 10 MB PDF never has to fit through the
  * platform's request-body limit, and nobody unauthenticated can spend API
- * credit. ANTHROPIC_API_KEY lives only in the server environment.
+ * credit. GEMINI_API_KEY lives only in the server environment.
  *
  * Responses:
  *   200 { extraction }                 structured result (see src/lib/extract.ts)
  *   401 { error }                      not signed in
- *   415 { error }                      file type Claude cannot read
+ *   415 { error }                      file type that cannot be read
  *   422 { error }                      model declined or returned unusable output
- *   503 { error: "not_configured" }    ANTHROPIC_API_KEY not set — the UI falls
+ *   503 { error: "not_configured" }    GEMINI_API_KEY not set — the UI falls
  *                                      back to manual entry with the file attached
  */
 
-import Anthropic from "@anthropic-ai/sdk";
 import { createClient } from "@supabase/supabase-js";
 import { EXTRACTABLE_TYPES, type ExtractionRfqItem } from "@/lib/extract";
-import { extractQuotation } from "@/lib/claudeExtract";
+import { extractQuotation, ExtractionApiError } from "@/lib/quoteExtract";
 
-// A multi-page PDF with adaptive thinking can take a minute or more.
+// A multi-page PDF can take a minute or more to read.
 export const maxDuration = 300;
 
 const BUCKET = "quotation-files";
 const MAX_PDF_BYTES = 10 * 1024 * 1024;
-const MAX_IMAGE_BYTES = 3.5 * 1024 * 1024; // base64 must stay under the API's 5 MB image cap
+const MAX_IMAGE_BYTES = 3.5 * 1024 * 1024; // the browser already shrinks photos to ~3 MB
 
 function mediaTypeFor(path: string, blobType: string): string {
   if (blobType && EXTRACTABLE_TYPES[blobType]) return blobType;
@@ -48,7 +47,7 @@ export async function POST(request: Request) {
   const { data: userData, error: authErr } = await sb.auth.getUser(token);
   if (authErr || !userData.user) return Response.json({ error: "Not signed in." }, { status: 401 });
 
-  if (!process.env.ANTHROPIC_API_KEY) {
+  if (!process.env.GEMINI_API_KEY) {
     return Response.json({ error: "not_configured" }, { status: 503 });
   }
 
@@ -97,7 +96,7 @@ export async function POST(request: Request) {
   }
   const data = Buffer.from(await blob.arrayBuffer()).toString("base64");
 
-  // --- Claude -----------------------------------------------------------
+  // --- Gemini -----------------------------------------------------------
   try {
     const result = await extractQuotation({ data, mediaType, items, isMaterial });
     if (result.ok) return Response.json({ extraction: result.extraction });
@@ -109,17 +108,17 @@ export async function POST(request: Request) {
     }[result.failure.kind];
     return Response.json({ error: message }, { status: result.failure.kind === "unsupported_type" ? 415 : 422 });
   } catch (err) {
-    if (err instanceof Anthropic.AuthenticationError) {
-      return Response.json({ error: "The AI key is invalid — check ANTHROPIC_API_KEY." }, { status: 503 });
-    }
-    if (err instanceof Anthropic.RateLimitError) {
-      return Response.json({ error: "Too many quotations at once — try again in a minute." }, { status: 429 });
-    }
-    if (err instanceof Anthropic.BadRequestError) {
-      return Response.json({ error: `The file could not be processed: ${err.message}` }, { status: 422 });
-    }
-    if (err instanceof Anthropic.APIError) {
-      return Response.json({ error: `AI service error (${err.status ?? "?"}). Try again.` }, { status: 502 });
+    if (err instanceof ExtractionApiError) {
+      if (err.status === 401 || err.status === 403) {
+        return Response.json({ error: "The AI key is invalid or not allowed — check GEMINI_API_KEY." }, { status: 503 });
+      }
+      if (err.status === 429) {
+        return Response.json({ error: "Too many quotations at once — try again in a minute." }, { status: 429 });
+      }
+      if (err.status === 400) {
+        return Response.json({ error: `The file could not be processed: ${err.message}` }, { status: 422 });
+      }
+      return Response.json({ error: `AI service error (${err.status}). Try again.` }, { status: 502 });
     }
     return Response.json({ error: "Unexpected error while reading the quotation." }, { status: 500 });
   }
