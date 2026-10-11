@@ -194,10 +194,12 @@ export function mapExtraction(
     const price = parsePrice(hit.unit_price);
     const qty = parseQty(hit.qty);
     const offered = hit.material.trim();
-    const notes = [
-      offered && !sameGrade(offered, it.materialType) ? `Offered ${offered}` : "",
-      hit.line_note.trim(),
-    ].filter(Boolean).join(" · ");
+    const lineNote = hit.line_note.trim();
+    // Skip our own "Offered …" when the model's note already names the grade,
+    // or the card reads "Offered SUS420J2 · Offered SUS420J2 for STAVAX".
+    const flagGrade = offered && !sameGrade(offered, it.materialType) &&
+      !lineNote.toUpperCase().includes(offered.toUpperCase());
+    const notes = [flagGrade ? `Offered ${offered}` : "", lineNote].filter(Boolean).join(" · ");
     return {
       // A line the supplier addressed but did not price stays unticked, so it
       // cannot enter the totals — its note explains why.

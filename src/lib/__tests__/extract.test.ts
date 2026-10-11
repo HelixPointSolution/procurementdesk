@@ -99,6 +99,14 @@ describe("mapExtraction", () => {
     expect(m.lines[1].notes).toContain("Offered 1.2083");
   });
 
+  it("does not repeat the grade when the supplier note already names it", () => {
+    const m = mapExtraction({
+      supplier_name: "WONG", currency: "RM", notes: "",
+      lines: [line({ item_number: 2, unit_price: "13.4", material: "SUS420J2", line_note: "Offered SUS420J2 for STAVAX." })],
+    }, ITEMS, "file");
+    expect(m.lines[1].notes).toBe("Offered SUS420J2 for STAVAX.");
+  });
+
   it("parses prices with thousands separators", () => {
     const m = mapExtraction({
       supplier_name: "X", currency: "RM", notes: "", lines: [line({ item_number: 1, unit_price: "1,250.00" })],
