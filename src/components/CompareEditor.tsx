@@ -9,6 +9,12 @@
  * correcting, but it sits collapsed under "Check / edit figures" instead of
  * being the whole page.
  *
+ * 16 Oct 2026 (client's first real use): files are read ONE AT A TIME (in
+ * parallel they tripped the AI's rate limit), a failed read can be retried
+ * with "Read again", a screenshot can be pasted with Ctrl+V, a supplier's
+ * message can be pasted as text, and the result ends with a per-item table —
+ * cheapest and closest size, size first — with an optional split award.
+ *
  * Unchanged underneath: suppliers may quote different dimensions than asked
  * (off-spec, flagged) or skip items; the tool recommends ("Claude's Choice")
  * but the purchaser decides; Award writes Purchase History. Edits persist
@@ -19,7 +25,11 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useSearchParams } from "next/navigation";
 import { supabase } from "@/lib/supabase/client";
 import type { RfqKind, RfqRow, RfqItemRow, QuoteRow, QuoteItemRow, SupplierRow, QuoteAttachmentRow } from "@/lib/types";
-import { analyseQuotes, byRmPerKg, type ComparisonResult, type SupplierAnalysis } from "@/lib/compare";
+import {
+  analyseQuotes, byRmPerKg, perItemPicks, pickedOffer, splitPlan,
+  type ComparisonResult, type ItemPicks, type SplitPlan, type SupplierAnalysis,
+} from "@/lib/compare";
+import { sizeFitText, type SizeFit } from "@/lib/dimensions";
 import { parseQty, parsePrice } from "@/lib/num";
 import { debounce, syncRows, type SaveState } from "@/lib/persist";
 import {
@@ -54,13 +64,110 @@ interface QuoteDraft {
 interface UploadJob {
   key: string;
   filename: string;
-  status: "working" | "done" | "error";
+  status: "waiting" | "working" | "done" | "error";
   message: string;
 }
 
+/** Progress or problem shown on one supplier card (Read again / Add page). */
+interface CardStatus {
+  text: string;
+  busy: boolean;
+}
+
+interface StoredFile {
+  path: string;
+  filename: string;
+  mime: string;
+  size: number;
+}
+
 const ATTACH_BUCKET = "quotation-files";
+const ACCEPT = ".pdf,image/jpeg,image/png,image/webp";
 
 const rm = (n: number) => "RM " + n.toFixed(2);
+
+/** "item 2" / "items 1, 3, 4" from 0-based indexes. */
+const itemList = (ks: number[]) => `item${ks.length > 1 ? "s" : ""} ${ks.map((k) => k + 1).join(", ")}`;
+
+const timeStamp = () => new Date().toLocaleTimeString("en-GB").replace(/:/g, ".");
+
+/** The supplier name a file gives when nothing better is known:
+ *  "Quo 2026 (part 1 of 3).png" → "Quo 2026". */
+function placeholderName(filename: string): string {
+  return nameFromFilename(filename).replace(/ \(part \d+ of \d+\)$/, "");
+}
+
+/** Still named after its file (or unnamed), so a fresh reading may rename it. */
+function hasPlaceholderName(name: string, atts: Array<{ filename: string }>): boolean {
+  const bare = name.trim().replace(/ \(\d+\)$/, "");
+  return bare === "" || atts.some((a) => bare === placeholderName(a.filename));
+}
+
+/** Browsers name every pasted picture "image.png" — give it a name a purchaser can tell apart. */
+function namePasted(f: File, n: number, all: File[]): File {
+  if (f.name && !/^image\.(png|jpe?g|gif|webp)$/i.test(f.name)) return f;
+  const ext = (f.type.split("/")[1] || "png").replace("jpeg", "jpg");
+  return new File([f], `Pasted picture ${timeStamp()}${all.length > 1 ? `-${n + 1}` : ""}.${ext}`, { type: f.type });
+}
+
+function extractionItems(its: RfqItemRow[]) {
+  return its.map((it) => ({
+    materialType: it.material_type ?? "",
+    description: it.description ?? "",
+    thicknessRaw: it.thickness_raw ?? "",
+    heightRaw: it.height_raw ?? "",
+    lengthRaw: it.length_raw ?? "",
+    qty: it.qty,
+    itemRef: it.item_ref ?? "",
+  }));
+}
+
+/** Prepare (shrink, cut long screenshots into pages) and store files under an RFQ. */
+async function storeFiles(
+  rid: string, originals: File[], progress: (message: string) => void
+): Promise<{ ok: true; files: StoredFile[] } | { ok: false; error: string }> {
+  const prepared: File[] = [];
+  for (const f of originals) {
+    const p = await prepareQuotationFile(f);
+    if (!p.ok) return { ok: false, error: p.error };
+    prepared.push(...p.files);
+  }
+  progress(prepared.length > 1 ? `Uploading ${prepared.length} pages…` : "Uploading…");
+  const sb = supabase();
+  const files: StoredFile[] = [];
+  for (const file of prepared) {
+    const safe = file.name.replace(/[^\w.\-() ]+/g, "_");
+    const path = `${rid}/${crypto.randomUUID()}-${safe}`;
+    const contentType = file.type.startsWith("text/plain") ? "text/plain;charset=utf-8" : file.type || undefined;
+    const up = await sb.storage.from(ATTACH_BUCKET).upload(path, file, { contentType });
+    if (up.error) {
+      if (files.length > 0) await sb.storage.from(ATTACH_BUCKET).remove(files.map((x) => x.path));
+      return { ok: false, error: "Upload failed: " + up.error.message };
+    }
+    files.push({ path, filename: file.name, mime: file.type, size: file.size });
+  }
+  return { ok: true, files };
+}
+
+/** Ask the server to read stored files as ONE supplier's quotation. */
+async function readStored(rid: string, paths: string[]): Promise<{ extraction: Extraction | null; problem: string }> {
+  try {
+    const { data: sess } = await supabase().auth.getSession();
+    const res = await fetch("/api/extract-quote", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${sess.session?.access_token ?? ""}` },
+      body: JSON.stringify({ rfqId: rid, paths }),
+    });
+    const body = await res.json().catch(() => ({}));
+    if (res.ok && body.extraction) return { extraction: body.extraction as Extraction, problem: "" };
+    if (body.error === "not_configured") {
+      return { extraction: null, problem: "Automatic reading is not switched on yet — type the prices under “Check / edit figures”." };
+    }
+    return { extraction: null, problem: (body.error as string) || `Could not read the quotation (${res.status}) — press “Read again”.` };
+  } catch {
+    return { extraction: null, problem: "Could not reach the reader — check the internet connection, then press “Read again”." };
+  }
+}
 
 export default function CompareEditor({ kind }: { kind: RfqKind }) {
   const isMaterial = kind === "material";
@@ -81,6 +188,15 @@ export default function CompareEditor({ kind }: { kind: RfqKind }) {
   const [choice, setChoice] = useState("");
   const [awardMsg, setAwardMsg] = useState("");
   const [awarding, setAwarding] = useState(false);
+  const [splitMsg, setSplitMsg] = useState("");
+  /** Per-item supplier picks the purchaser changed, by RFQ item id. */
+  const [picks, setPicks] = useState<Record<string, string>>({});
+  /** By quote id. */
+  const [cardStatus, setCardStatusMap] = useState<Record<string, CardStatus>>({});
+  const [pasteText, setPasteText] = useState("");
+  const [pasteName, setPasteName] = useState("");
+  const [pasteOpen, setPasteOpen] = useState(false);
+  const [pasteHint, setPasteHint] = useState("");
 
   const knownQuoteIds = useRef<string[]>([]);
   const loading = useRef(false);
@@ -91,6 +207,19 @@ export default function CompareEditor({ kind }: { kind: RfqKind }) {
   /** Latest quotes for code running across awaits (processFile). */
   const quotesRef = useRef<QuoteDraft[]>([]);
   useEffect(() => { quotesRef.current = quotes; }, [quotes]);
+  /** Quotations are read one after another, never in parallel: parallel
+   *  calls tripped the AI's rate limit on the client's first real use. */
+  const queue = useRef<Promise<void>>(Promise.resolve());
+  function enqueue(run: () => Promise<void>) {
+    queue.current = queue.current.then(run).catch((e) => { console.error(e); });
+  }
+  function setCardStatus(id: string, status: CardStatus | null) {
+    setCardStatusMap((prev) => {
+      const next = { ...prev };
+      if (status) next[id] = status; else delete next[id];
+      return next;
+    });
+  }
 
   // ---------- initial lists ----------
   useEffect(() => {
@@ -115,7 +244,10 @@ export default function CompareEditor({ kind }: { kind: RfqKind }) {
     dirty.current = false;
     setRfqId(id);
     setAwardMsg("");
+    setSplitMsg("");
     setChoice("");
+    setPicks({});
+    setCardStatusMap({});
     setSaveState("idle");
     setJobs([]);
     if (!id) { setItems([]); setQuotes([]); loading.current = false; return; }
@@ -273,82 +405,48 @@ export default function CompareEditor({ kind }: { kind: RfqKind }) {
   const setJob = (key: string, patch: Partial<UploadJob>) =>
     setJobs((prev) => prev.map((j) => (j.key === key ? { ...j, ...patch } : j)));
 
-  /** One quotation file, end to end. Writes the quote straight to the
-   *  database (header, lines, attachment) and only then adds the finished
-   *  card to state, so a half-read file never shows up as a card. */
-  async function processFile(original: File) {
-    const key = crypto.randomUUID();
-    setJobs((prev) => [...prev, { key, filename: original.name, status: "working", message: "Preparing…" }]);
-
-    const prepared = await prepareQuotationFile(original);
-    if (!prepared.ok) { setJob(key, { status: "error", message: prepared.error }); return; }
-    const file = prepared.file;
+  /** One supplier's quotation (a file, a pasted picture or pasted text), end
+   *  to end. Writes the quote straight to the database (header, lines,
+   *  attachments) and only then adds the finished card to state, so a
+   *  half-read file never shows up as a card. */
+  async function processSubmission(key: string, rid: string, its: RfqItemRow[], original: File, nameHint?: string) {
+    setJob(key, { status: "working", message: "Preparing…" });
     const sb = supabase();
+    const stored = await storeFiles(rid, [original], (message) => setJob(key, { message }));
+    if (!stored.ok) { setJob(key, { status: "error", message: stored.error }); return; }
+    const paths = stored.files.map((f) => f.path);
 
-    // 1. Store the file.
-    setJob(key, { message: "Uploading…" });
-    const safe = file.name.replace(/[^\w.\-() ]+/g, "_");
-    const path = `${rfqId}/${crypto.randomUUID()}-${safe}`;
-    const up = await sb.storage.from(ATTACH_BUCKET).upload(path, file, { contentType: file.type || undefined });
-    if (up.error) { setJob(key, { status: "error", message: "Upload failed: " + up.error.message }); return; }
-
-    // 2. Read it.
     setJob(key, { message: "Reading the quotation… (usually under a minute)" });
-    let extraction: Extraction | null = null;
-    let readProblem = "";
-    try {
-      const { data: sess } = await sb.auth.getSession();
-      const res = await fetch("/api/extract-quote", {
-        method: "POST",
-        headers: { "Content-Type": "application/json", Authorization: `Bearer ${sess.session?.access_token ?? ""}` },
-        body: JSON.stringify({ rfqId, path }),
-      });
-      const body = await res.json().catch(() => ({}));
-      if (res.ok && body.extraction) extraction = body.extraction as Extraction;
-      else if (body.error === "not_configured") readProblem = "Automatic reading is not switched on yet — type the prices under “Check / edit figures”.";
-      else readProblem = (body.error as string) || `Could not read the quotation (${res.status}).`;
-    } catch {
-      readProblem = "Could not reach the reader — type the prices under “Check / edit figures”.";
-    }
+    const { extraction, problem } = await readStored(rid, paths);
 
-    // 3. Build the card.
-    const itemsForMap = items.map((it) => ({
-      materialType: it.material_type ?? "",
-      description: it.description ?? "",
-      thicknessRaw: it.thickness_raw ?? "",
-      heightRaw: it.height_raw ?? "",
-      lengthRaw: it.length_raw ?? "",
-      qty: it.qty,
-      itemRef: it.item_ref ?? "",
-    }));
-    const fallbackName = nameFromFilename(original.name);
+    const fallbackName = nameHint?.trim() || nameFromFilename(original.name);
     const mapped = extraction
-      ? mapExtraction(extraction, itemsForMap, fallbackName)
+      ? mapExtraction(extraction, extractionItems(its), fallbackName)
       : {
-          supplierName: fallbackName, notes: "", warnings: [readProblem],
-          lines: items.map((it): MappedLine => ({ ...blankQuoteItem(it, false) })),
+          supplierName: fallbackName, notes: "", warnings: [problem],
+          lines: its.map((it): MappedLine => ({ ...blankQuoteItem(it, false) })),
         };
-
+    // A name the purchaser typed for pasted text wins over whatever the text says.
     const taken = [...quotesRef.current.map((q) => q.supplierName), ...reservedNames.current];
-    const supplierName = uniqueSupplierName(mapped.supplierName, taken);
+    const supplierName = uniqueSupplierName(nameHint?.trim() || mapped.supplierName, taken);
     reservedNames.current.add(supplierName);
 
-    // 4. Persist header, lines and attachment.
     setJob(key, { message: "Saving…" });
+    let quoteId = "";
     try {
       const { data: userData } = await sb.auth.getUser();
       const who = userData.user?.email ?? "";
       const { data: qrow, error: qErr } = await sb.from("quotes").insert({
-        rfq_id: rfqId,
+        rfq_id: rid,
         supplier_name: supplierName,
         supplier_id: suppliers.find((s) => s.name.toLowerCase() === supplierName.toLowerCase())?.id ?? null,
         notes: mapped.notes,
       }).select("id").single();
       if (qErr || !qrow) throw new Error(qErr?.message ?? "could not save the supplier");
-      const quoteId = qrow.id as string;
+      quoteId = qrow.id as string;
 
       const lineRows = mapped.lines
-        .map((l, k) => ({ l, it: items[k] }))
+        .map((l, k) => ({ l, it: its[k] }))
         .filter(({ l, it }) => l.quoted && !!it)
         .map(({ l, it }) => ({
           quote_id: quoteId,
@@ -367,40 +465,167 @@ export default function CompareEditor({ kind }: { kind: RfqKind }) {
         for (const r of (inserted ?? []) as Array<{ id: string; rfq_item_id: string }>) idByItem.set(r.rfq_item_id, r.id);
       }
 
-      const { data: att, error: attErr } = await sb.from("quote_attachments").insert({
-        quote_id: quoteId, path, filename: original.name, mime: file.type, size: file.size, uploaded_by: who,
-      }).select("*").single();
-      if (attErr || !att) throw new Error(attErr?.message ?? "could not record the file");
+      const { data: atts, error: attErr } = await sb.from("quote_attachments").insert(
+        stored.files.map((f) => ({
+          quote_id: quoteId, path: f.path, filename: f.filename, mime: f.mime, size: f.size, uploaded_by: who,
+        }))
+      ).select("*");
+      if (attErr || !atts) throw new Error(attErr?.message ?? "could not record the file");
 
       const card: QuoteDraft = {
         id: quoteId,
         supplierName,
         notes: mapped.notes,
         warnings: mapped.warnings,
-        attachments: [att as QuoteAttachmentRow],
+        attachments: atts as QuoteAttachmentRow[],
         knownItemIds: [...idByItem.values()],
-        items: items.map((it, k) => ({ ...mapped.lines[k], id: idByItem.get(it.id) })),
+        items: its.map((it, k) => ({ ...mapped.lines[k], id: idByItem.get(it.id) })),
       };
       knownQuoteIds.current = [...knownQuoteIds.current, quoteId];
+      // The next queued file starts before React re-renders; let it see this name.
+      quotesRef.current = [...quotesRef.current, card];
       // Appended without touch(): it is already saved, so no autosave is needed.
       setQuotes((prev) => [...prev, card]);
       setJob(key, {
         status: "done",
         message: extraction
           ? `Read as ${supplierName}${mapped.warnings.length ? " — please check the flagged points" : ""}`
-          : `Added as ${supplierName} — ${readProblem}`,
+          : `Added as ${supplierName} — ${problem}`,
       });
     } catch (e) {
-      await sb.storage.from(ATTACH_BUCKET).remove([path]);
+      if (quoteId) await sb.from("quotes").delete().eq("id", quoteId);
+      await sb.storage.from(ATTACH_BUCKET).remove(paths);
       setJob(key, { status: "error", message: "Could not save: " + (e instanceof Error ? e.message : "unknown error") });
     } finally {
       reservedNames.current.delete(supplierName);
     }
   }
 
-  function handleFiles(list: FileList | null) {
+  /** Read a saved card's files again — after a busy or failed read, or after
+   *  a page was added — and replace its figures with the fresh reading. */
+  async function rereadCard(id: string, rid: string, its: RfqItemRow[], atts: Array<{ path: string; filename: string }>) {
+    if (atts.length === 0) { setCardStatus(id, null); return; }
+    setCardStatus(id, { text: "Reading the quotation… (usually under a minute)", busy: true });
+    const { extraction, problem } = await readStored(rid, atts.map((a) => a.path));
+    if (!extraction) {
+      setCardStatus(id, null);
+      // Warnings are not persisted, so no touch().
+      setQuotes((prev) => prev.map((q) => (q.id === id ? { ...q, warnings: [problem] } : q)));
+      return;
+    }
+    const mapped = mapExtraction(extraction, extractionItems(its), placeholderName(atts[0].filename));
+    touch();
+    setQuotes((prev) => prev.map((q) => {
+      if (q.id !== id) return q;
+      // Replace a file-name placeholder with the company the reader found;
+      // keep a name the purchaser chose.
+      const rename = hasPlaceholderName(q.supplierName, atts) && extraction.supplier_name.trim() !== "";
+      const others = prev.filter((x) => x !== q).map((x) => x.supplierName);
+      return {
+        ...q,
+        supplierName: rename ? uniqueSupplierName(mapped.supplierName, others) : q.supplierName,
+        notes: mapped.notes,
+        warnings: mapped.warnings,
+        // Lines still quoted keep their row id; a line no longer quoted drops
+        // it, so its row is deleted on save rather than updated in place.
+        items: its.map((_, k) => ({ ...mapped.lines[k], id: mapped.lines[k].quoted ? q.items[k]?.id : undefined })),
+      };
+    }));
+    setCardStatus(id, null);
+  }
+
+  /** More pages (or a first file) for a saved supplier, then read it all again. */
+  async function addPages(id: string, rid: string, its: RfqItemRow[], files: File[]) {
+    const q = quotesRef.current.find((x) => x.id === id);
+    if (!q) { setCardStatus(id, null); return; }
+    setCardStatus(id, { text: "Preparing…", busy: true });
+    const stored = await storeFiles(rid, files, (text) => setCardStatus(id, { text, busy: true }));
+    if (!stored.ok) { setCardStatus(id, { text: stored.error, busy: false }); return; }
+    const sb = supabase();
+    const { data: userData } = await sb.auth.getUser();
+    const { data: rows, error } = await sb.from("quote_attachments").insert(
+      stored.files.map((f) => ({
+        quote_id: id, path: f.path, filename: f.filename, mime: f.mime, size: f.size,
+        uploaded_by: userData.user?.email ?? "",
+      }))
+    ).select("*");
+    if (error || !rows) {
+      await sb.storage.from(ATTACH_BUCKET).remove(stored.files.map((f) => f.path));
+      setCardStatus(id, { text: "Could not save: " + (error?.message ?? "unknown error"), busy: false });
+      return;
+    }
+    const added = rows as QuoteAttachmentRow[];
+    setQuotes((prev) => prev.map((x) => (x.id === id ? { ...x, attachments: [...x.attachments, ...added] } : x)));
+    await rereadCard(id, rid, its, [...q.attachments, ...added]);
+  }
+
+  function handleFiles(list: FileList | File[] | null, nameHint?: string) {
     if (!list || !rfqId || rfqStage === "pr") return;
-    Array.from(list).forEach((f) => { processFile(f); });
+    const rid = rfqId;
+    const its = items;
+    for (const f of Array.from(list)) {
+      const key = crypto.randomUUID();
+      setJobs((prev) => [...prev, { key, filename: f.name, status: "waiting", message: "Waiting — quotations are read one at a time…" }]);
+      enqueue(() => processSubmission(key, rid, its, f, nameHint));
+    }
+  }
+
+  function requestReread(i: number) {
+    const q = quotes[i];
+    if (!q.id || q.attachments.length === 0) return;
+    if (q.items.some((qi) => qi.quoted) &&
+        !confirm("Read again replaces this supplier's figures with a fresh reading of its file(s). Continue?")) return;
+    const id = q.id, rid = rfqId, its = items;
+    setCardStatus(id, { text: "Waiting — quotations are read one at a time…", busy: true });
+    enqueue(() => rereadCard(id, rid, its, quotesRef.current.find((x) => x.id === id)?.attachments ?? []));
+  }
+
+  function requestAddPages(i: number, list: FileList | null) {
+    const q = quotes[i];
+    if (!list || list.length === 0 || !q.id) return;
+    if (q.items.some((qi) => qi.quoted) &&
+        !confirm("Adding a page reads the whole quotation again and replaces this supplier's figures. Continue?")) return;
+    const id = q.id, rid = rfqId, its = items, files = Array.from(list);
+    setCardStatus(id, { text: "Waiting — quotations are read one at a time…", busy: true });
+    enqueue(() => addPages(id, rid, its, files));
+  }
+
+  // ---------- paste: pictures and text (client, 16 Oct) ----------
+  async function pasteFromClipboard() {
+    setPasteHint("");
+    if (!navigator.clipboard?.read) {
+      setPasteHint("This browser can't paste from a button — press Ctrl+V instead.");
+      return;
+    }
+    try {
+      const entries = await navigator.clipboard.read();
+      const files: File[] = [];
+      let text = "";
+      for (const entry of entries) {
+        const pic = entry.types.find((t) => t.startsWith("image/"));
+        if (pic) {
+          files.push(new File([await entry.getType(pic)], `image.${pic.split("/")[1]}`, { type: pic }));
+        } else if (entry.types.includes("text/plain")) {
+          text += await (await entry.getType("text/plain")).text();
+        }
+      }
+      if (files.length > 0) handleFiles(files.map(namePasted));
+      else if (text.trim()) { setPasteText(text); setPasteOpen(true); }
+      else setPasteHint("Nothing to paste — copy a screenshot or the supplier's message first.");
+    } catch {
+      setPasteHint("The browser blocked the clipboard — press Ctrl+V instead.");
+    }
+  }
+
+  function readPastedText() {
+    const text = pasteText.trim();
+    if (!text) return;
+    const name = pasteName.trim();
+    const safeName = name.replace(/[^\w\-() ]+/g, " ").trim();
+    handleFiles([new File([text], `${safeName || "Pasted text"} ${timeStamp()}.txt`, { type: "text/plain" })], name || undefined);
+    setPasteText("");
+    setPasteName("");
+    setPasteOpen(false);
   }
 
   // ---------- manual editing ----------
@@ -417,8 +642,11 @@ export default function CompareEditor({ kind }: { kind: RfqKind }) {
   }
   function setQuoteItem(i: number, k: number, patch: Partial<QuoteItemDraft>) {
     touch();
+    // An unticked line's row is deleted on save. Drop its id, or ticking it
+    // again would "update" a row that no longer exists and lose the line.
+    const p = patch.quoted === false ? { ...patch, id: undefined } : patch;
     setQuotes((prev) => prev.map((q, j) =>
-      j === i ? { ...q, items: q.items.map((qi, l) => (l === k ? { ...qi, ...patch } : qi)) } : q
+      j === i ? { ...q, items: q.items.map((qi, l) => (l === k ? { ...qi, ...p } : qi)) } : q
     ));
   }
   async function removeQuote(i: number) {
@@ -439,18 +667,20 @@ export default function CompareEditor({ kind }: { kind: RfqKind }) {
   }
 
   // ---------- analysis (always live) ----------
+  const inquiry = useMemo(() => items.map((it) => ({
+    id: it.id,
+    materialType: it.material_type ?? "",
+    thicknessRaw: it.thickness_raw ?? "",
+    heightRaw: it.height_raw ?? "",
+    lengthRaw: it.length_raw ?? "",
+    qty: it.qty,
+    itemRef: it.item_ref ?? "",
+  })), [items]);
+
   const result: ComparisonResult | null = useMemo(() => {
-    if (items.length === 0) return null;
+    if (inquiry.length === 0) return null;
     return analyseQuotes(
-      items.map((it) => ({
-        id: it.id,
-        materialType: it.material_type ?? "",
-        thicknessRaw: it.thickness_raw ?? "",
-        heightRaw: it.height_raw ?? "",
-        lengthRaw: it.length_raw ?? "",
-        qty: it.qty,
-        itemRef: it.item_ref ?? "",
-      })),
+      inquiry,
       quotes
         .filter((q) => q.supplierName.trim())
         .map((q) => ({
@@ -470,7 +700,14 @@ export default function CompareEditor({ kind }: { kind: RfqKind }) {
             })),
         }))
     );
-  }, [items, quotes]);
+  }, [inquiry, items, quotes]);
+
+  // Per item: material picks by size first (client, 16 Oct); general by price.
+  const itemPicks = useMemo(
+    () => (result ? perItemPicks(result, inquiry, isMaterial) : []),
+    [result, inquiry, isMaterial]
+  );
+  const plan = useMemo(() => splitPlan(itemPicks, picks), [itemPicks, picks]);
 
   // Purchaser's Choice defaults to the recommendation, but is revalidated
   // whenever the analysis changes — a stale name would otherwise award a
@@ -501,9 +738,62 @@ export default function CompareEditor({ kind }: { kind: RfqKind }) {
     setAwardMsg(`Awarded to ${chosen.supplierName} — recorded in Purchase History ✓`);
   }
 
+  /** Option A — one Purchase History row per supplier, for the items picked from it. */
+  async function awardSplit() {
+    if (awarding || plan.bySupplier.length === 0) return;
+    setAwarding(true);
+    const ref = rfqs.find((r) => r.id === rfqId)?.subject ?? "";
+    const { data: userData } = await supabase().auth.getUser();
+    const rows = plan.bySupplier.map((g) => ({
+      rfq_id: rfqId,
+      ref,
+      awarded_to: g.supplierName,
+      total_rm: Math.round(g.subtotal * 100) / 100,
+      notes: [
+        `Split award — ${itemList(g.items)}`,
+        result?.suppliers.find((s) => s.supplierName === g.supplierName)?.notes ?? "",
+      ].filter(Boolean).join(" · "),
+      created_by: userData.user?.email ?? "",
+    }));
+    const { error } = await supabase().from("purchase_history").insert(rows);
+    setAwarding(false);
+    if (error) { setPageError(error.message); return; }
+    setSplitMsg(rows.length === 1
+      ? `Awarded to ${rows[0].awarded_to} — recorded in Purchase History ✓`
+      : `Recorded in Purchase History — one row per supplier (${rows.length}) ✓`);
+  }
+
   const rfq = rfqs.find((r) => r.id === rfqId);
   const ready = !!rfqId && rfqStage !== "pr" && items.length > 0;
-  const working = jobs.some((j) => j.status === "working");
+  const working =
+    jobs.some((j) => j.status === "waiting" || j.status === "working") ||
+    Object.values(cardStatus).some((c) => c.busy);
+
+  // Ctrl+V anywhere on the page (outside a field) adds a copied screenshot or
+  // file as a supplier quotation, or opens the paste-text box with copied text.
+  const handleFilesRef = useRef(handleFiles);
+  useEffect(() => { handleFilesRef.current = handleFiles; });
+  useEffect(() => {
+    if (!ready) return;
+    const onPaste = (e: ClipboardEvent) => {
+      const target = e.target as HTMLElement | null;
+      if (target?.closest?.("input, textarea, select, [contenteditable='true']")) return;
+      const files = Array.from(e.clipboardData?.files ?? []);
+      if (files.length > 0) {
+        e.preventDefault();
+        handleFilesRef.current(files.map(namePasted));
+        return;
+      }
+      const text = e.clipboardData?.getData("text/plain") ?? "";
+      if (text.trim()) {
+        e.preventDefault();
+        setPasteText(text);
+        setPasteOpen(true);
+      }
+    };
+    document.addEventListener("paste", onPaste);
+    return () => document.removeEventListener("paste", onPaste);
+  }, [ready]);
   const analysisFor = (name: string) => result?.suppliers.find((s) => s.supplierName === name.trim());
 
   return (
@@ -515,7 +805,9 @@ export default function CompareEditor({ kind }: { kind: RfqKind }) {
             id="cmp-rfq"
             value={rfqId}
             onChange={(e) => loadRfq(e.target.value)}
-            className="fld min-w-56"
+            disabled={working}
+            title={working ? "Wait until the quotations have been read" : undefined}
+            className="fld min-w-56 disabled:opacity-60"
           >
             {rfqs.length === 0 && <option value="">No RFQs yet</option>}
             {rfqs.map((r) => (
@@ -555,21 +847,65 @@ export default function CompareEditor({ kind }: { kind: RfqKind }) {
             <div className="text-3xl" aria-hidden>📄</div>
             <div className="font-semibold mt-1">Drop quotations here, or click to choose</div>
             <div className="hint mt-1">
-              One file per supplier — PDF or photo (JPG / PNG). Select 2 or 3 at once. The prices
-              are read automatically; check them before awarding.
+              One file per supplier — PDF, photo or screenshot (long screenshots are fine). Select 2 or 3
+              at once. The prices are read automatically; check them before awarding.
             </div>
             <input
-              type="file" multiple accept=".pdf,image/jpeg,image/png,image/webp"
+              type="file" multiple accept={ACCEPT}
               className="hidden"
               onChange={(e) => { handleFiles(e.target.files); e.target.value = ""; }}
             />
           </label>
 
+          <div className="flex gap-3 items-center flex-wrap mt-2">
+            <button onClick={pasteFromClipboard} className="btn-ghost text-sm">📋 Paste screenshot</button>
+            <span className="hint">or copy a screenshot and press Ctrl+V anywhere on this page</span>
+            {pasteHint && <span className="text-sm text-amber-700">{pasteHint}</span>}
+          </div>
+
+          <details
+            open={pasteOpen}
+            onToggle={(e) => setPasteOpen((e.currentTarget as HTMLDetailsElement).open)}
+            className="mt-2"
+          >
+            <summary className="text-sm text-blue-700 cursor-pointer select-none">
+              ✍ Prices came in a WhatsApp or email message? Paste the text
+            </summary>
+            <div className="mt-2 space-y-2">
+              <textarea
+                aria-label="Supplier's message"
+                value={pasteText}
+                onChange={(e) => setPasteText(e.target.value)}
+                rows={6}
+                placeholder="Paste one supplier's message here — items, sizes and prices."
+                className="w-full fld text-sm"
+              />
+              <div className="flex gap-3 items-end flex-wrap">
+                <div>
+                  <label htmlFor="paste-name" className="lbl">Supplier (optional)</label>
+                  <input
+                    id="paste-name"
+                    value={pasteName}
+                    onChange={(e) => setPasteName(e.target.value)}
+                    list="supplier-names"
+                    placeholder="Supplier name"
+                    className="fld text-sm min-w-48"
+                  />
+                </div>
+                <button onClick={readPastedText} disabled={!pasteText.trim()} className="btn-primary disabled:opacity-50">
+                  Read this text
+                </button>
+              </div>
+            </div>
+          </details>
+
           {jobs.length > 0 && (
             <ul className="mt-2 space-y-1 text-sm" aria-live="polite">
               {jobs.map((j) => (
                 <li key={j.key} className="flex gap-2 items-start">
-                  <span aria-hidden>{j.status === "working" ? "⏳" : j.status === "done" ? "✅" : "⚠️"}</span>
+                  <span aria-hidden>
+                    {j.status === "waiting" ? "🕒" : j.status === "working" ? "⏳" : j.status === "done" ? "✅" : "⚠️"}
+                  </span>
                   <span>
                     <b>{j.filename}</b> — <span className={j.status === "error" ? "text-red-700" : "text-gray-600"}>{j.message}</span>
                   </span>
@@ -586,6 +922,8 @@ export default function CompareEditor({ kind }: { kind: RfqKind }) {
           <div className="chart-title">2. Suppliers</div>
           {quotes.map((q, i) => {
             const a = analysisFor(q.supplierName);
+            const st = q.id ? cardStatus[q.id] : undefined;
+            const cardBusy = !!st?.busy;
             return (
               <div key={q.id ?? `new-${i}`} className="card space-y-2">
                 <div className="flex gap-3 items-center flex-wrap">
@@ -607,6 +945,28 @@ export default function CompareEditor({ kind }: { kind: RfqKind }) {
                       📎 {f.filename}
                     </button>
                   ))}
+                  {q.id && q.attachments.length > 0 && (
+                    <button
+                      onClick={() => requestReread(i)}
+                      disabled={cardBusy}
+                      className="text-xs text-blue-700 underline disabled:opacity-50"
+                      title="Read this supplier's file(s) again"
+                    >
+                      ↻ Read again
+                    </button>
+                  )}
+                  {q.id && (
+                    <label
+                      className={`text-xs text-blue-700 underline cursor-pointer ${cardBusy ? "opacity-50 pointer-events-none" : ""}`}
+                      title="Another page or screenshot of this supplier's quotation"
+                    >
+                      {q.attachments.length > 0 ? "+ Add page" : "+ Attach quotation"}
+                      <input
+                        type="file" multiple accept={ACCEPT} className="hidden" disabled={cardBusy}
+                        onChange={(e) => { requestAddPages(i, e.target.files); e.target.value = ""; }}
+                      />
+                    </label>
+                  )}
                   <button
                     onClick={() => removeQuote(i)}
                     aria-label={`Remove ${q.supplierName || "supplier"}`}
@@ -619,7 +979,12 @@ export default function CompareEditor({ kind }: { kind: RfqKind }) {
                 {q.supplierName.trim() === "" && (
                   <div className="text-xs text-amber-700">Give this supplier a name — unnamed quotes are not saved.</div>
                 )}
-                {q.warnings.length > 0 && (
+                {st && (
+                  <div className={`text-sm ${st.busy ? "text-gray-600" : "text-red-700"}`} aria-live="polite">
+                    {st.busy ? "⏳" : "⚠"} {st.text}
+                  </div>
+                )}
+                {q.warnings.length > 0 && !cardBusy && (
                   <div className="flag mt-0">{q.warnings.map((w) => <div key={w}>⚠ {w}</div>)}</div>
                 )}
                 {q.notes && <div className="text-xs text-gray-600">{q.notes}</div>}
@@ -745,6 +1110,19 @@ export default function CompareEditor({ kind }: { kind: RfqKind }) {
           </div>
 
           <Chart1 result={result} items={items} isMaterial={isMaterial} choice={choice} />
+
+          <PerItem
+            picks={itemPicks}
+            overrides={picks}
+            onPick={(itemId, name) => { setPicks((prev) => ({ ...prev, [itemId]: name })); setSplitMsg(""); }}
+            plan={plan}
+            result={result}
+            items={items}
+            isMaterial={isMaterial}
+            awarding={awarding}
+            onAward={awardSplit}
+            message={splitMsg}
+          />
 
           {isMaterial && (
             <details>
@@ -928,10 +1306,8 @@ function Chart3({ result, items }: { result: ComparisonResult; items: RfqItemRow
                     <td className={ok ? "match" : "miss"}>{v || "—"} {ok ? "✓" : "✗"}</td>
                   );
                   const missing: string[] = [];
-                  if (!a.thicknessOk) missing.push("thickness");
-                  if (!a.heightOk) missing.push("height");
-                  if (!a.lengthOk) missing.push("length");
-                  if (!a.qtyOk) missing.push("qty");
+                  if (a.fit && a.fit.kind !== "exact") missing.push(sizeFitText(a.fit));
+                  if (!a.qtyOk) missing.push("qty differs");
                   return (
                     <tr key={s.supplierName}>
                       <td className="font-medium">{s.supplierName}</td>
@@ -950,6 +1326,164 @@ function Chart3({ result, items }: { result: ComparisonResult; items: RfqItemRow
           </div>
         </div>
       ))}
+    </div>
+  );
+}
+
+function FitBadge({ fit }: { fit: SizeFit }) {
+  const tone = {
+    exact: "bg-green-100 text-green-800",
+    bigger: "bg-amber-100 text-amber-800",
+    unknown: "bg-gray-100 text-gray-600",
+    smaller: "bg-red-100 text-red-800",
+  }[fit.kind];
+  return (
+    <span className={`inline-block rounded px-1.5 py-0.5 text-xs font-medium whitespace-nowrap ${tone}`}>
+      {fit.kind === "exact" ? "✓ " : fit.kind === "smaller" ? "⚠ " : ""}{sizeFitText(fit)}
+    </span>
+  );
+}
+
+/* PER ITEM — cheapest and closest size (client, 16 Oct 2026)
+ * "go by item … 尺寸最重要": who is cheapest, whose size is closest, and a
+ * pick per item that follows the size (the purchaser can change it). Then
+ * Option A (split the order by item) next to Option B (one supplier). */
+function PerItem({
+  picks, overrides, onPick, plan, result, items, isMaterial, awarding, onAward, message,
+}: {
+  picks: ItemPicks[];
+  overrides: Record<string, string>;
+  onPick: (itemId: string, supplierName: string) => void;
+  plan: SplitPlan;
+  result: ComparisonResult;
+  items: RfqItemRow[];
+  isMaterial: boolean;
+  awarding: boolean;
+  onAward: () => void;
+  message: string;
+}) {
+  const one = result.recommended;
+  const covered = items.length - plan.uncovered.length;
+  const sameCoverage = one != null && one.quotedCount === covered && plan.uncovered.length === 0;
+  return (
+    <div>
+      <div className="chart-title">{isMaterial ? "Per item — cheapest and closest size" : "Per item — cheapest"}</div>
+      <p className="hint mb-1">
+        {isMaterial
+          ? "For each item: who is cheapest, and whose size is closest to what we asked. The pick follows the size (exact first, then the nearest bigger piece); change it if you prefer."
+          : "For each item: who is cheapest. Change the pick if you prefer another supplier."}
+      </p>
+      <div className="overflow-x-auto tbl-wrap">
+        <table className="w-full text-sm">
+          <thead>
+            <tr>
+              <th scope="col">Item</th>
+              <th scope="col">Cheapest</th>
+              {isMaterial && <th scope="col">Closest size</th>}
+              <th scope="col">Pick</th>
+              <th scope="col">Line total</th>
+            </tr>
+          </thead>
+          <tbody>
+            {picks.map((p, k) => {
+              const it = items[k];
+              const o = pickedOffer(p, overrides[p.inquiry.id]);
+              const spec = isMaterial
+                ? [it?.material_type, [it?.thickness_raw, it?.height_raw, it?.length_raw].filter(Boolean).join(" × ")].filter(Boolean).join(" ")
+                : it?.description ?? "";
+              return (
+                <tr key={p.inquiry.id}>
+                  <td className="min-w-40">
+                    <b>Item {k + 1}</b>
+                    <div className="text-xs text-gray-500">{spec}{it?.qty != null ? ` · ${it.qty} pcs` : ""}</div>
+                  </td>
+                  <td>
+                    {p.cheapest
+                      ? <>{p.cheapest.supplierName} <span className="text-gray-500 whitespace-nowrap">({rm(p.cheapest.price)}/pc)</span></>
+                      : <span className="text-gray-400">not quoted</span>}
+                  </td>
+                  {isMaterial && (
+                    <td>
+                      {p.closest
+                        ? <>{p.closest.supplierName} <FitBadge fit={p.closest.fit} /></>
+                        : <span className="text-gray-400">—</span>}
+                    </td>
+                  )}
+                  <td>
+                    {o ? (
+                      <select
+                        aria-label={`Supplier for item ${k + 1}`}
+                        value={o.supplierName}
+                        onChange={(e) => onPick(p.inquiry.id, e.target.value)}
+                        className="fld text-sm max-w-72"
+                      >
+                        {p.offers.map((of) => (
+                          <option key={of.supplierName} value={of.supplierName}>
+                            {of.supplierName} — {rm(of.price)}{isMaterial ? ` · ${sizeFitText(of.fit)}` : ""}
+                          </option>
+                        ))}
+                      </select>
+                    ) : <span className="text-gray-400">nobody quoted</span>}
+                  </td>
+                  <td className="whitespace-nowrap">
+                    {o ? <>{rm(o.lineTotal)} <span className="text-xs text-gray-500">({o.qty} pcs)</span></> : ""}
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+
+      <div className="grid gap-3 sm:grid-cols-2 mt-3">
+        <div className="card space-y-1">
+          <div className="font-semibold">Option A — split by item</div>
+          <div className="text-sm">
+            {plan.bySupplier.length > 0
+              ? plan.bySupplier.map((g) => `${g.supplierName} (${itemList(g.items)})`).join(" + ")
+              : "No priced items yet."}
+          </div>
+          <div className="text-sm">
+            Total: <b>{rm(plan.total)}</b>{" "}
+            <span className="text-gray-500">· {covered}/{items.length} items, at the quoted quantities</span>
+          </div>
+          {plan.uncovered.length > 0 && (
+            <div className="text-sm miss">⚠ {itemList(plan.uncovered)} — nobody quoted</div>
+          )}
+          <div className="flex gap-3 items-center flex-wrap pt-1">
+            <button onClick={onAward} disabled={awarding || plan.bySupplier.length === 0} className="btn-award disabled:opacity-50">
+              {awarding ? "Recording…" : "🏆 Award split & record in Purchase History"}
+            </button>
+            {message && <span className="text-green-800 text-sm">{message}</span>}
+          </div>
+          {plan.bySupplier.length > 1 && (
+            <div className="hint">Writes one Purchase History row per supplier, with its items and subtotal.</div>
+          )}
+        </div>
+
+        <div className="card space-y-1">
+          <div className="font-semibold">Option B — one supplier</div>
+          {one ? (
+            <>
+              <div className="text-sm">{one.supplierName}</div>
+              <div className="text-sm">
+                Total: <b>{rm(one.total)}</b>{" "}
+                <span className="text-gray-500">· covers {one.quotedCount}/{items.length} items</span>
+              </div>
+              {sameCoverage && Math.abs(plan.total - one.total) >= 0.005 && (
+                <div className="text-sm">
+                  {plan.total < one.total
+                    ? `Splitting saves ${rm(one.total - plan.total)}.`
+                    : `One supplier is ${rm(plan.total - one.total)} cheaper.`}
+                </div>
+              )}
+              <div className="hint">Same as Claude&apos;s Choice above — award it there.</div>
+            </>
+          ) : (
+            <div className="text-sm text-gray-500">No comparable quote yet.</div>
+          )}
+        </div>
+      </div>
     </div>
   );
 }

@@ -68,3 +68,56 @@ export function dimsMatch(
   if (a === null || b === null) return false;
   return Math.abs(a.value - b.value) < tolerance;
 }
+
+export type SizeFitKind = "exact" | "bigger" | "unknown" | "smaller";
+
+export interface SizeFit {
+  kind: SizeFitKind;
+  /** mm over ("bigger") or under ("smaller") what we asked, summed over the dimensions. 0 otherwise. */
+  deltaMm: number;
+}
+
+/**
+ * How a quoted piece compares with the inquiry size, IGNORING THE ORDER the
+ * dimensions are written in: suppliers write 60 × 15 × 90 for our 15 × 60 × 90,
+ * and a block is the same block either way. Sorting
+ * both sets is also the right test for "can our part be cut from this piece".
+ *   exact   — every dimension matches
+ *   bigger  — nothing under size, something over: usable, needs machining down
+ *   smaller — something is under size: the part cannot be made from it
+ *   unknown — the supplier did not state (all of) the size
+ */
+export function sizeFit(
+  inquiry: Array<string | null | undefined>,
+  quoted: Array<string | null | undefined>,
+  tolerance = 0.001
+): SizeFit {
+  const values = (xs: Array<string | null | undefined>) =>
+    xs.map(dimValue).filter((v): v is number => v != null).sort((a, b) => a - b);
+  const a = values(inquiry);
+  const q = values(quoted);
+  if (a.length === 0 && q.length === 0) return { kind: "exact", deltaMm: 0 };
+  if (q.length === 0 || q.length !== a.length) return { kind: "unknown", deltaMm: 0 };
+
+  let over = 0;
+  let under = 0;
+  a.forEach((v, i) => {
+    const d = q[i] - v;
+    if (d > tolerance) over += d;
+    else if (d < -tolerance) under -= d;
+  });
+  const mm = (x: number) => Math.round(x * 100) / 100;
+  if (under > 0) return { kind: "smaller", deltaMm: mm(under) };
+  if (over > 0) return { kind: "bigger", deltaMm: mm(over) };
+  return { kind: "exact", deltaMm: 0 };
+}
+
+/** "exact size", "bigger +1.5 mm", "too small −2 mm", "size not stated". */
+export function sizeFitText(fit: SizeFit): string {
+  switch (fit.kind) {
+    case "exact": return "exact size";
+    case "bigger": return `bigger +${fit.deltaMm} mm`;
+    case "smaller": return `too small −${fit.deltaMm} mm`;
+    default: return "size not stated";
+  }
+}

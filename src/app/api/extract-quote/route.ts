@@ -1,6 +1,8 @@
 /* POST /api/extract-quote — read one supplier quotation with Gemini.
  *
- * Body: { rfqId: string, path: string }  (path = object in the quotation-files bucket)
+ * Body: { rfqId: string, paths: string[] }  objects in the quotation-files
+ *       bucket, in page order — one PDF, several pictures of one quotation,
+ *       or a pasted message stored as .txt. ({ path } is still accepted.)
  * Auth: the caller's Supabase access token as "Authorization: Bearer …".
  *
  * The file is fetched from Supabase Storage here, server-side, under the
@@ -13,25 +15,35 @@
  *   401 { error }                      not signed in
  *   415 { error }                      file type that cannot be read
  *   422 { error }                      model declined or returned unusable output
+ *   429 / 503 { error, retryable }     every model busy or rate-limited — try again shortly
  *   503 { error: "not_configured" }    GEMINI_API_KEY not set — the UI falls
  *                                      back to manual entry with the file attached
  */
 
 import { createClient } from "@supabase/supabase-js";
 import { EXTRACTABLE_TYPES, type ExtractionRfqItem } from "@/lib/extract";
-import { extractQuotation, ExtractionApiError } from "@/lib/quoteExtract";
+import { extractQuotation, ExtractionApiError, isBusyError, type QuotationFile } from "@/lib/quoteExtract";
 
 // A multi-page PDF can take a minute or more to read.
 export const maxDuration = 300;
 
 const BUCKET = "quotation-files";
-const MAX_PDF_BYTES = 10 * 1024 * 1024;
-const MAX_IMAGE_BYTES = 3.5 * 1024 * 1024; // the browser already shrinks photos to ~3 MB
+const MAX_BYTES = { pdf: 10 * 1024 * 1024, image: 5 * 1024 * 1024, text: 200 * 1024 } as const;
+// Gemini takes at most 20 MB of inline data per request, and base64 adds a third.
+const MAX_TOTAL_BYTES = 14 * 1024 * 1024;
+const MAX_FILES = 12;
+
+const BUSY_MESSAGE = "Google's AI is busy right now — wait a minute, then press “Read again”.";
+const LIMIT_MESSAGE = "The AI's usage limit was reached for now — wait a minute, then press “Read again”.";
 
 function mediaTypeFor(path: string, blobType: string): string {
-  if (blobType && EXTRACTABLE_TYPES[blobType]) return blobType;
+  const t = blobType.split(";")[0].trim().toLowerCase();
+  if (t && EXTRACTABLE_TYPES[t]) return t;
   const ext = path.toLowerCase().split(".").pop() ?? "";
-  return ({ pdf: "application/pdf", jpg: "image/jpeg", jpeg: "image/jpeg", png: "image/png", webp: "image/webp", gif: "image/gif" } as Record<string, string>)[ext] ?? blobType;
+  return ({
+    pdf: "application/pdf", jpg: "image/jpeg", jpeg: "image/jpeg", png: "image/png",
+    webp: "image/webp", gif: "image/gif", txt: "text/plain",
+  } as Record<string, string>)[ext] ?? t;
 }
 
 export async function POST(request: Request) {
@@ -52,10 +64,14 @@ export async function POST(request: Request) {
   }
 
   // --- input ------------------------------------------------------------
-  let body: { rfqId?: string; path?: string };
+  let body: { rfqId?: string; path?: string; paths?: unknown };
   try { body = await request.json(); } catch { return Response.json({ error: "Bad request." }, { status: 400 }); }
-  const { rfqId, path } = body;
-  if (!rfqId || !path || !path.startsWith(`${rfqId}/`)) {
+  const { rfqId } = body;
+  const paths: unknown[] = Array.isArray(body.paths) ? body.paths : body.path ? [body.path] : [];
+  if (
+    !rfqId || paths.length === 0 || paths.length > MAX_FILES ||
+    !paths.every((p): p is string => typeof p === "string" && p.startsWith(`${rfqId}/`))
+  ) {
     return Response.json({ error: "Bad request." }, { status: 400 });
   }
 
@@ -80,25 +96,30 @@ export async function POST(request: Request) {
     return Response.json({ error: "This RFQ has no reviewed items to match against." }, { status: 422 });
   }
 
-  const { data: blob, error: dlErr } = await sb.storage.from(BUCKET).download(path);
-  if (dlErr || !blob) return Response.json({ error: "Could not read the uploaded file." }, { status: 404 });
-
-  const mediaType = mediaTypeFor(path, blob.type);
-  const kind = EXTRACTABLE_TYPES[mediaType];
-  if (!kind) {
-    return Response.json(
-      { error: "Only PDF, JPG, PNG or WebP files can be read automatically." },
-      { status: 415 }
-    );
+  const downloads = await Promise.all(paths.map((p) => sb.storage.from(BUCKET).download(p)));
+  const files: QuotationFile[] = [];
+  let totalBytes = 0;
+  for (let n = 0; n < paths.length; n++) {
+    const { data: blob, error: dlErr } = downloads[n];
+    if (dlErr || !blob) return Response.json({ error: "Could not read the uploaded file." }, { status: 404 });
+    const mediaType = mediaTypeFor(paths[n], blob.type);
+    const kind = EXTRACTABLE_TYPES[mediaType];
+    if (!kind) {
+      return Response.json(
+        { error: "Only PDF, JPG, PNG or WebP files can be read automatically." },
+        { status: 415 }
+      );
+    }
+    totalBytes += blob.size;
+    if (blob.size > MAX_BYTES[kind] || totalBytes > MAX_TOTAL_BYTES) {
+      return Response.json({ error: "File is too large to read automatically." }, { status: 413 });
+    }
+    files.push({ mediaType, data: Buffer.from(await blob.arrayBuffer()).toString("base64") });
   }
-  if (blob.size > (kind === "pdf" ? MAX_PDF_BYTES : MAX_IMAGE_BYTES)) {
-    return Response.json({ error: "File is too large to read automatically." }, { status: 413 });
-  }
-  const data = Buffer.from(await blob.arrayBuffer()).toString("base64");
 
   // --- Gemini -----------------------------------------------------------
   try {
-    const result = await extractQuotation({ data, mediaType, items, isMaterial });
+    const result = await extractQuotation({ files, items, isMaterial });
     if (result.ok) return Response.json({ extraction: result.extraction });
     const message = {
       refusal: "The quotation could not be read automatically.",
@@ -108,18 +129,24 @@ export async function POST(request: Request) {
     }[result.failure.kind];
     return Response.json({ error: message }, { status: result.failure.kind === "unsupported_type" ? 415 : 422 });
   } catch (err) {
+    // Status and message only — never the file or the prices.
+    console.error(
+      "extract-quote failed:",
+      err instanceof ExtractionApiError ? err.status : "",
+      err instanceof Error ? err.message : String(err)
+    );
     if (err instanceof ExtractionApiError) {
       if (err.status === 401 || err.status === 403) {
         return Response.json({ error: "The AI key is invalid or not allowed — check GEMINI_API_KEY." }, { status: 503 });
       }
-      if (err.status === 429) {
-        return Response.json({ error: "Too many quotations at once — try again in a minute." }, { status: 429 });
-      }
+      if (err.status === 429) return Response.json({ error: LIMIT_MESSAGE, retryable: true }, { status: 429 });
       if (err.status === 400) {
         return Response.json({ error: `The file could not be processed: ${err.message}` }, { status: 422 });
       }
-      return Response.json({ error: `AI service error (${err.status}). Try again.` }, { status: 502 });
+      if (isBusyError(err)) return Response.json({ error: BUSY_MESSAGE, retryable: true }, { status: 503 });
+      return Response.json({ error: `AI service error (${err.status}). Press “Read again”.` }, { status: 502 });
     }
+    if (isBusyError(err)) return Response.json({ error: BUSY_MESSAGE, retryable: true }, { status: 503 });
     return Response.json({ error: "Unexpected error while reading the quotation." }, { status: 500 });
   }
 }

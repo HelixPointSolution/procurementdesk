@@ -2,8 +2,8 @@
  *
  * The client asked (25 Sep 2026) for the Compare tab to work like this:
  * upload the 2–3 suppliers' quotations, and compare. No typing grids up front.
- * The route handler (src/app/api/extract-quote/route.ts) sends the file to
- * Claude with EXTRACTION_SCHEMA; this module builds the prompt and turns the
+ * The route handler (src/app/api/extract-quote/route.ts) sends the file(s) to
+ * Gemini with EXTRACTION_SCHEMA; this module builds the prompt and turns the
  * model's answer into the quote-card shape CompareEditor already persists.
  *
  * Everything here is deterministic and unit-tested; nothing calls the network.
@@ -92,8 +92,30 @@ function itemLabel(it: ExtractionRfqItem, isMaterial: boolean): string {
   return [it.materialType, dims.join(" x ")].filter(Boolean).join(" ");
 }
 
-/** The instruction sent alongside the quotation file. */
-export function buildExtractionPrompt(items: ExtractionRfqItem[], isMaterial: boolean): string {
+/** What the quotation arrived as: how many parts (files / pasted texts), and
+ *  whether any of them is text copied from a message. */
+export interface QuotationSource {
+  parts: number;
+  hasText: boolean;
+}
+
+function sourceIntro(src: QuotationSource): string {
+  if (src.parts <= 1) {
+    return src.hasText
+      ? "The text above is a supplier's quotation, copied from a message, replying to our request for quotation (RFQ)."
+      : "The attached file is a supplier's quotation replying to our request for quotation (RFQ).";
+  }
+  return `The ${src.parts} parts above (files${src.hasText ? " and pasted text" : ""}) are, in order, the pages of ONE ` +
+    `supplier's quotation replying to our request for quotation (RFQ). Pictures cut from one long screenshot ` +
+    `overlap slightly at the edges: a line that appears on two pages is still one line.`;
+}
+
+/** The instruction sent alongside the quotation file(s). */
+export function buildExtractionPrompt(
+  items: ExtractionRfqItem[],
+  isMaterial: boolean,
+  source: QuotationSource = { parts: 1, hasText: false }
+): string {
   const list = items
     .map((it, i) => {
       const qty = it.qty == null ? "" : ` — qty ${it.qty}`;
@@ -124,6 +146,9 @@ export function buildExtractionPrompt(items: ExtractionRfqItem[], isMaterial: bo
             `thickness/height/length and mention the order size in line_note.`,
           `Record sizes exactly as the supplier quoted them, never copied from our list — suppliers often change ` +
             `sizes and the purchaser needs to see what was really offered. If a size is not stated, leave it empty.`,
+          `Suppliers sometimes write the same dimensions in a different order (for example width first). Put them ` +
+            `in our order — thickness, height, length — matching each value to our nearest dimension, but never ` +
+            `change a value.`,
           `Put the material grade the supplier actually offers in material, even when it differs from ours ` +
             `(for example 1.2083 or SUS420J2 offered for STAVAX).`,
         ]
@@ -133,7 +158,7 @@ export function buildExtractionPrompt(items: ExtractionRfqItem[], isMaterial: bo
   ];
 
   return (
-    `The attached file is a supplier's quotation replying to our request for quotation (RFQ). ` +
+    `${sourceIntro(source)} ` +
     `We asked for these items:\n\n${list}\n${notation}\n` +
     `Read the quotation and fill in the structured fields.\n\n` +
     rules.map((r) => `- ${r}`).join("\n")
@@ -261,9 +286,10 @@ export function nameFromFilename(filename: string): string {
   return filename.replace(/\.[^.]+$/, "").replace(/[_]+/g, " ").trim() || "Supplier";
 }
 
-/** Media types the Claude API accepts for documents / images. */
-export const EXTRACTABLE_TYPES: Record<string, "pdf" | "image"> = {
+/** What the reader accepts. "text" is a supplier's message pasted on the Compare tab. */
+export const EXTRACTABLE_TYPES: Record<string, "pdf" | "image" | "text"> = {
   "application/pdf": "pdf",
+  "text/plain": "text",
   "image/jpeg": "image",
   "image/png": "image",
   "image/webp": "image",

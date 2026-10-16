@@ -15,7 +15,7 @@
  *     that supplier the cheapest and win the award.
  */
 
-import { dimsMatch } from "./dimensions";
+import { dimsMatch, sizeFit, type SizeFit, type SizeFitKind } from "./dimensions";
 import { pieceWeightKg } from "./weight";
 
 export interface InquiryItem {
@@ -52,6 +52,8 @@ export interface ItemAnalysis {
   lengthOk: boolean;
   qtyOk: boolean;
   specOk: boolean;
+  /** Size compared with the inquiry, ignoring dimension order. Null when not quoted. */
+  fit: SizeFit | null;
   /** Quantity actually used for pricing (the supplier's, else the inquiry's). */
   effectiveQty: number | null;
   lineTotal: number | null;
@@ -98,15 +100,22 @@ export function analyseQuotes(
       const base = {
         inquiry: inq,
         thicknessOk: false, heightOk: false, lengthOk: false, qtyOk: false,
-        specOk: false, effectiveQty: null, lineTotal: null, lineWeightKg: null,
+        specOk: false, fit: null, effectiveQty: null, lineTotal: null, lineWeightKg: null,
       };
       if (!quoted || quoted.price == null) {
         return { ...base, quoted: null, issue: null };
       }
 
-      const thicknessOk = dimsMatch(inq.thicknessRaw, quoted.thicknessRaw);
-      const heightOk = dimsMatch(inq.heightRaw, quoted.heightRaw);
-      const lengthOk = dimsMatch(inq.lengthRaw, quoted.lengthRaw);
+      // Same values in a different order (60 × 15 × 90 for our 15 × 60 × 90)
+      // is the same piece, not three mismatches.
+      const fit = sizeFit(
+        [inq.thicknessRaw, inq.heightRaw, inq.lengthRaw],
+        [quoted.thicknessRaw, quoted.heightRaw, quoted.lengthRaw]
+      );
+      const exact = fit.kind === "exact";
+      const thicknessOk = exact || dimsMatch(inq.thicknessRaw, quoted.thicknessRaw);
+      const heightOk = exact || dimsMatch(inq.heightRaw, quoted.heightRaw);
+      const lengthOk = exact || dimsMatch(inq.lengthRaw, quoted.lengthRaw);
       const qtyOk = quoted.qty == null || inq.qty == null || quoted.qty === inq.qty;
 
       // Price at the quantity the supplier actually quoted (MOQ realities),
@@ -116,7 +125,7 @@ export function analyseQuotes(
       if (effectiveQty == null) {
         return {
           ...base, quoted,
-          thicknessOk, heightOk, lengthOk, qtyOk,
+          thicknessOk, heightOk, lengthOk, qtyOk, fit,
           specOk: thicknessOk && heightOk && lengthOk && qtyOk,
           issue: `Item ${inquiry.indexOf(inq) + 1}: no quantity — cannot price`,
         };
@@ -130,7 +139,7 @@ export function analyseQuotes(
       });
       return {
         inquiry: inq, quoted,
-        thicknessOk, heightOk, lengthOk, qtyOk,
+        thicknessOk, heightOk, lengthOk, qtyOk, fit,
         specOk: thicknessOk && heightOk && lengthOk && qtyOk,
         effectiveQty,
         lineTotal: quoted.price * effectiveQty,
@@ -221,4 +230,97 @@ export function byRmPerKg(a: SupplierAnalysis, b: SupplierAnalysis): number {
   if (a.rmPerKg == null) return 1;
   if (b.rmPerKg == null) return -1;
   return a.rmPerKg - b.rmPerKg;
+}
+
+/* ---------- Per item: cheapest and closest size ----------
+ *
+ * Client, 16 Oct 2026: "go by item … 尺寸最重要" — for each item, show who is
+ * cheapest and whose size is closest to what we asked, and pick per item with
+ * SIZE FIRST. An exact size beats a bigger piece (usable, needs machining
+ * down), which beats an unstated size, which beats a piece that is too small
+ * (cannot make the part). Within the same kind, the smaller difference wins,
+ * then the lower price. The purchaser can override any pick.
+ */
+
+export interface ItemOffer {
+  supplierName: string;
+  /** RM per piece as quoted. */
+  price: number;
+  /** Quantity the line is priced at. */
+  qty: number;
+  lineTotal: number;
+  fit: SizeFit;
+}
+
+export interface ItemPicks {
+  inquiry: InquiryItem;
+  /** Every priced offer, preferred first (size first for material, price otherwise). */
+  offers: ItemOffer[];
+  cheapest: ItemOffer | null;
+  /** Best size match. Null for general (non-material) RFQs. */
+  closest: ItemOffer | null;
+}
+
+const FIT_RANK: Record<SizeFitKind, number> = { exact: 0, bigger: 1, unknown: 2, smaller: 3 };
+
+/** Size first, then the smaller difference, then price. */
+export function bySizeThenPrice(a: ItemOffer, b: ItemOffer): number {
+  return FIT_RANK[a.fit.kind] - FIT_RANK[b.fit.kind] || a.fit.deltaMm - b.fit.deltaMm || a.price - b.price;
+}
+
+function byPriceThenSize(a: ItemOffer, b: ItemOffer): number {
+  return a.price - b.price || bySizeThenPrice(a, b);
+}
+
+export function perItemPicks(result: ComparisonResult, inquiry: InquiryItem[], sizeMatters: boolean): ItemPicks[] {
+  return inquiry.map((inq, k) => {
+    const offers: ItemOffer[] = result.suppliers.flatMap((s) => {
+      const a = s.items[k];
+      if (!a?.quoted || a.quoted.price == null || a.lineTotal == null || a.effectiveQty == null) return [];
+      return [{
+        supplierName: s.supplierName,
+        price: a.quoted.price,
+        qty: a.effectiveQty,
+        lineTotal: a.lineTotal,
+        fit: a.fit ?? { kind: "unknown", deltaMm: 0 },
+      }];
+    });
+    offers.sort(sizeMatters ? bySizeThenPrice : byPriceThenSize);
+    return {
+      inquiry: inq,
+      offers,
+      cheapest: offers.slice().sort(byPriceThenSize)[0] ?? null,
+      closest: sizeMatters ? offers[0] ?? null : null,
+    };
+  });
+}
+
+/** The purchaser's override when it is still on offer, else the preferred offer. */
+export function pickedOffer(p: ItemPicks, override: string | undefined): ItemOffer | null {
+  return p.offers.find((o) => o.supplierName === override) ?? p.offers[0] ?? null;
+}
+
+export interface SplitPlan {
+  total: number;
+  /** One entry per supplier, in item order. `items` are 0-based indexes. */
+  bySupplier: Array<{ supplierName: string; items: number[]; subtotal: number }>;
+  /** Items nobody priced. */
+  uncovered: number[];
+}
+
+/** Option A — order each item from its picked supplier. */
+export function splitPlan(picks: ItemPicks[], overrides: Record<string, string>): SplitPlan {
+  const groups = new Map<string, { supplierName: string; items: number[]; subtotal: number }>();
+  const uncovered: number[] = [];
+  let total = 0;
+  picks.forEach((p, k) => {
+    const o = pickedOffer(p, overrides[p.inquiry.id]);
+    if (!o) { uncovered.push(k); return; }
+    total += o.lineTotal;
+    const g = groups.get(o.supplierName) ?? { supplierName: o.supplierName, items: [], subtotal: 0 };
+    g.items.push(k);
+    g.subtotal += o.lineTotal;
+    groups.set(o.supplierName, g);
+  });
+  return { total, bySupplier: [...groups.values()], uncovered };
 }

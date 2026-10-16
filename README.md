@@ -11,12 +11,16 @@ Excel improvement spec ("Procurement Desk (1).xlsx"): Next.js + Supabase
    email (Copy / Open in Gmail / Mail app). Notation preserved verbatim:
    `(9.50)` = order size · `9.50` = finishing size (+5mm max allowance) · `Ø4.00` = diameter.
 2. **RFQ General** — non-material items: Description / Qty / Ref.
-3. **Quote Comparison (Material)** — upload the suppliers' quotations (PDF/photo); Gemini (gemini-3.8-flash) reads
-   the prices into supplier cards (needs `GEMINI_API_KEY`, see Setup). Per-supplier quotes; suppliers may quote different
-   dims (off-spec, flagged on every dimension) or skip items. Charts: As Quoted,
-   Normalised RM/kg, Spec Match. Claude's Choice (recommendation) vs Purchaser's Choice
+3. **Quote Comparison (Material)** — upload the suppliers' quotations (PDF, photo, screenshot — or paste a
+   screenshot with Ctrl+V, or paste a supplier's message as text); Gemini reads the prices into supplier cards
+   (needs `GEMINI_API_KEY`, see Setup). Files are read one at a time; if gemini-3.8-flash is busy or rate-limited
+   the reader falls back to gemini-3.7-flash, then gemini-3.5-flash, and a failed card has "Read again". Long
+   screenshots are cut into overlapping pages in the browser so small print stays readable.
+   Suppliers may quote different dims (off-spec, flagged; dimension order is ignored) or skip items. Charts: As Quoted,
+   Per item (cheapest + closest size, size first, with an optional split award — one Purchase History row per
+   supplier), Normalised RM/kg, Spec Match. Claude's Choice (recommendation) vs Purchaser's Choice
    (final) → Award writes Purchase History.
-4. **Quote Comparison (General)** — simple totals comparison + award.
+4. **Quote Comparison (General)** — simple totals comparison + per-item cheapest + award.
 5. **Supplier List** — master data: material groups → ordered suppliers (order = suggestion priority).
 6. **Purchase History** — auto-filled on award, fully editable.
 
